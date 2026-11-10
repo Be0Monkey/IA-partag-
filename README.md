@@ -1,1 +1,1 @@
-# IA-partag-
+# IA-partage-
