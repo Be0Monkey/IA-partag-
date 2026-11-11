@@ -1,4 +1,4 @@
-﻿"""Client MCP du bus IA-partag : donne à Claude les outils envoyer_message / lire_messages / statut.
+"""Client MCP du bus IA-partag : donne à Claude les outils envoyer_message / lire_messages / statut.
 Configuration : variable d'environnement BUS_CONFIG = chemin d'un JSON {url, token, agent} (secret, hors dépôt)."""
 import json, os, urllib.request, urllib.error, uuid, time
 from mcp.server.mcpserver import MCPServer
@@ -38,6 +38,16 @@ def lire_messages() -> str:
 def statut() -> str:
     """Indique qui est connecté et combien de messages sont en attente."""
     return json.dumps(call("/status"), ensure_ascii=False)
+
+@mcp.tool()
+def demander_validation(action: str, details: str = "") -> str:
+    """Demande l'accord de l'HUMAIN avant une action sensible (suppression, argent, sécurité, architecture, installation à risque, fusion avec conflit). N'exécute PAS l'action tant que l'humain n'a pas approuvé : la décision t'arrive dans ta boîte (message de H, fil validation-N). action = une phrase précise ; details = contexte et risques."""
+    return json.dumps(call("/approval", "POST", {"action": action, "details": details}), ensure_ascii=False)
+
+@mcp.tool()
+def etat_validation(id: int) -> str:
+    """Donne l'état d'une demande de validation que tu as faite (en attente, approuvée, refusée, expirée)."""
+    return json.dumps(call(f"/approval/{int(id)}"), ensure_ascii=False)
 
 if __name__ == "__main__":
     mcp.run()
