@@ -1,6 +1,6 @@
 """Client MCP du bus IA-partag : donne à Claude les outils envoyer_message / lire_messages / statut.
 Configuration : variable d'environnement BUS_CONFIG = chemin d'un JSON {url, token, agent} (secret, hors dépôt)."""
-import json, os, urllib.request, urllib.error, uuid, time
+import json, os, urllib.parse, urllib.request, urllib.error, uuid, time
 from mcp.server.mcpserver import MCPServer
 
 CFG = json.loads(open(os.environ["BUS_CONFIG"], encoding="utf-8-sig").read())
@@ -49,5 +49,19 @@ def etat_validation(id: int) -> str:
     """Donne l'état d'une demande de validation que tu as faite (en attente, approuvée, refusée, expirée)."""
     return json.dumps(call(f"/approval/{int(id)}"), ensure_ascii=False)
 
+@mcp.tool()
+def memoire_lister(prefixe: str = "") -> str:
+    """Liste les clés de la mémoire partagée entre A et B (avec version, auteur, date). prefixe optionnel pour filtrer (ex. 'decisions/'). Ne contient jamais de secret."""
+    return json.dumps(call("/memory?prefix=" + urllib.parse.quote(prefixe)), ensure_ascii=False)
+
+@mcp.tool()
+def memoire_lire(cle: str) -> str:
+    """Lit une clé de la mémoire partagée. Retourne la valeur et sa version (à renvoyer à memoire_ecrire pour modifier)."""
+    return json.dumps(call("/memory?key=" + urllib.parse.quote(cle)), ensure_ascii=False)
+
+@mcp.tool()
+def memoire_ecrire(cle: str, valeur: str, version: int = 0) -> str:
+    """Écrit une clé de la mémoire partagée (décisions, conventions, état d'avancement : jamais de secret, jeton ni mot de passe). version = 0 pour créer une clé neuve ; pour modifier, donne la version lue : si l'autre Claude a modifié entre-temps, tu reçois un conflit avec la valeur actuelle (relis, fusionne, réessaie)."""
+    return json.dumps(call("/memory/put", "POST", {"key": cle, "value": valeur, "version": int(version)}), ensure_ascii=False)
 if __name__ == "__main__":
     mcp.run()
