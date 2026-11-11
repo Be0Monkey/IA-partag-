@@ -40,9 +40,9 @@ def statut() -> str:
     return json.dumps(call("/status"), ensure_ascii=False)
 
 @mcp.tool()
-def demander_validation(action: str, details: str = "") -> str:
-    """Demande l'accord de l'HUMAIN avant une action sensible (suppression, argent, sécurité, architecture, installation à risque, fusion avec conflit). N'exécute PAS l'action tant que l'humain n'a pas approuvé : la décision t'arrive dans ta boîte (message de H, fil validation-N). action = une phrase précise ; details = contexte et risques."""
-    return json.dumps(call("/approval", "POST", {"action": action, "details": details}), ensure_ascii=False)
+def demander_validation(action: str, details: str = "", critique: bool = False) -> str:
+    """Demande l'accord de l'HUMAIN avant une action sensible (suppression, argent, sécurité, architecture, installation à risque, fusion avec conflit). N'exécute PAS l'action tant que l'humain n'a pas approuvé : la décision t'arrive dans ta boîte (message de H, fil validation-N). action = une phrase précise ; details = contexte et risques. critique=True si l'action touche l'architecture, la sécurité, l'argent, les mots de passe/jetons ou une fusion Git : seul le propriétaire peut alors trancher (le serveur détecte aussi ces cas seul)."""
+    return json.dumps(call("/approval", "POST", {"action": action, "details": details, "critique": bool(critique)}), ensure_ascii=False)
 
 @mcp.tool()
 def etat_validation(id: int) -> str:
