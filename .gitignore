@@ -1,0 +1,12 @@
+﻿# Secrets et données locales : ne jamais les versionner (dépôt public)
+secrets/
+data/
+backups/
+*.db
+*.db-wal
+*.db-shm
+client_*.json
+tokens.json
+admin_password.txt
+*.lock
+__pycache__/
