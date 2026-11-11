@@ -1,0 +1,23 @@
+#!/bin/sh
+# IA-partag : garde-fou pre-push pour les sessions Claude.
+# Actif seulement si la variable IA_PARTAG_AGENT est définie (A ou B) par le projet Claude ; un humain dans son terminal n'est pas concerné.
+[ -z "$IA_PARTAG_AGENT" ] && exit 0
+zero=0000000000000000000000000000000000000000
+pref="agent-$(echo "$IA_PARTAG_AGENT" | tr 'A-Z' 'a-z')/"
+while read local_ref local_sha remote_ref remote_sha; do
+  case "$remote_ref" in
+    refs/heads/*) branch="${remote_ref#refs/heads/}" ;;
+    *) echo "IA-partag : seules les branches peuvent être poussées ($remote_ref refusé)." >&2; exit 1 ;;
+  esac
+  if [ "$local_sha" = "$zero" ]; then
+    echo "IA-partag : suppression d'une branche distante interdite ($branch)." >&2; exit 1
+  fi
+  case "$branch" in
+    "$pref"*) ;;
+    *) echo "IA-partag : le Claude $IA_PARTAG_AGENT ne pousse que sur $pref* (pas sur $branch). Une fusion vers main = demande de validation critique au propriétaire." >&2; exit 1 ;;
+  esac
+  if [ "$remote_sha" != "$zero" ] && ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+    echo "IA-partag : push forcé refusé sur $branch (l'historique distant serait réécrit)." >&2; exit 1
+  fi
+done
+exit 0

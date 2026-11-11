@@ -1,0 +1,67 @@
+"""Client MCP du bus IA-partag : donne à Claude les outils envoyer_message / lire_messages / statut.
+Configuration : variable d'environnement BUS_CONFIG = chemin d'un JSON {url, token, agent} (secret, hors dépôt)."""
+import json, os, urllib.parse, urllib.request, urllib.error, uuid, time
+from mcp.server.mcpserver import MCPServer
+
+CFG = json.loads(open(os.environ["BUS_CONFIG"], encoding="utf-8-sig").read())
+mcp = MCPServer("ia-partag-bus")
+
+def call(path, method="GET", body=None, retries=3):
+    data = json.dumps(body).encode() if body is not None else None
+    h = {"Authorization": "Bearer " + CFG["token"]}
+    if data: h["Content-Type"] = "application/json"
+    last = ""
+    for i in range(retries):   # reconnexion : on réessaie (l'uid évite les doublons)
+        try:
+            with urllib.request.urlopen(urllib.request.Request(CFG["url"] + path, data=data, headers=h, method=method), timeout=10) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            return {"erreur": e.read().decode()}
+        except Exception as e:
+            last = str(e); time.sleep(1 + i)
+    return {"erreur": f"serveur injoignable ({last}). Réessaie plus tard ou préviens l'humain."}
+
+@mcp.tool()
+def envoyer_message(a: str, texte: str, priorite: str = "normale", fil: str = "") -> str:
+    """Envoie un message à l'autre Claude ('A' ou 'B'). priorite = normale|urgente. fil = identifiant du fil pour répondre dans la même discussion (vide = nouveau fil)."""
+    return json.dumps(call("/send", "POST", {"to": a, "text": texte, "priority": priorite, "thread": fil, "uid": uuid.uuid4().hex}), ensure_ascii=False)
+
+@mcp.tool()
+def lire_messages() -> str:
+    """Lit les nouveaux messages qui te sont destinés (ils sont ensuite marqués comme lus = accusé de réception)."""
+    res = call("/inbox")
+    if "erreur" in res: return json.dumps(res, ensure_ascii=False)
+    if not res["messages"]: return "(aucun nouveau message)"
+    return "\n".join(f"[{m['date']}] fil={m['thread']} de={m['de']} priorité={m['priorite']} : {m['texte']}" for m in res["messages"])
+
+@mcp.tool()
+def statut() -> str:
+    """Indique qui est connecté et combien de messages sont en attente."""
+    return json.dumps(call("/status"), ensure_ascii=False)
+
+@mcp.tool()
+def demander_validation(action: str, details: str = "", critique: bool = False) -> str:
+    """Demande l'accord de l'HUMAIN avant une action sensible (suppression, argent, sécurité, architecture, installation à risque, fusion avec conflit). N'exécute PAS l'action tant que l'humain n'a pas approuvé : la décision t'arrive dans ta boîte (message de H, fil validation-N). action = une phrase précise ; details = contexte et risques. critique=True si l'action touche l'architecture, la sécurité, l'argent, les mots de passe/jetons ou une fusion Git : seul le propriétaire peut alors trancher (le serveur détecte aussi ces cas seul)."""
+    return json.dumps(call("/approval", "POST", {"action": action, "details": details, "critique": bool(critique)}), ensure_ascii=False)
+
+@mcp.tool()
+def etat_validation(id: int) -> str:
+    """Donne l'état d'une demande de validation que tu as faite (en attente, approuvée, refusée, expirée)."""
+    return json.dumps(call(f"/approval/{int(id)}"), ensure_ascii=False)
+
+@mcp.tool()
+def memoire_lister(prefixe: str = "") -> str:
+    """Liste les clés de la mémoire partagée entre A et B (avec version, auteur, date). prefixe optionnel pour filtrer (ex. 'decisions/'). Ne contient jamais de secret."""
+    return json.dumps(call("/memory?prefix=" + urllib.parse.quote(prefixe)), ensure_ascii=False)
+
+@mcp.tool()
+def memoire_lire(cle: str) -> str:
+    """Lit une clé de la mémoire partagée. Retourne la valeur et sa version (à renvoyer à memoire_ecrire pour modifier)."""
+    return json.dumps(call("/memory?key=" + urllib.parse.quote(cle)), ensure_ascii=False)
+
+@mcp.tool()
+def memoire_ecrire(cle: str, valeur: str, version: int = 0) -> str:
+    """Écrit une clé de la mémoire partagée (décisions, conventions, état d'avancement : jamais de secret, jeton ni mot de passe). version = 0 pour créer une clé neuve ; pour modifier, donne la version lue : si l'autre Claude a modifié entre-temps, tu reçois un conflit avec la valeur actuelle (relis, fusionne, réessaie)."""
+    return json.dumps(call("/memory/put", "POST", {"key": cle, "value": valeur, "version": int(version)}), ensure_ascii=False)
+if __name__ == "__main__":
+    mcp.run()
