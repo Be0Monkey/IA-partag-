@@ -38,7 +38,7 @@ r = c.get("/ui?filtre=urgents", headers=OWN).text
 check("filtre Urgents : fil urgent présent, fil normal absent de la liste", "fil-urg" in r and "fil-norm" not in r.split("Fils et messages")[1].split("Mémoire")[0] if "Fils et messages" in r else False)
 check("filtre actif visible avec réinitialisation", "Filtre actif : urgents" in r and "Réinitialiser" in r)
 r = c.get("/ui?sens=B", headers=OWN).text
-check("filtre expéditeur B : message de A absent du tableau", "urgence" not in r.split("Messages (30 derniers)")[1].split("</table>")[0] if "Messages (30 derniers)" in r else False)
+check("filtre expéditeur B : message de A absent du tableau", "urgence" not in r.split("Messages récents")[1].split("</table>")[0] if "Messages récents" in r else False)
 check("filtres Tous / Urgents / À récupérer / A / B présents", all(x in c.get("/ui", headers=OWN).text for x in ["Envoyés par A", "Envoyés par B", "À récupérer", "Urgents"]))
 
 # Copier le lien et le texte ; texte échappé dans l'attribut
@@ -87,7 +87,7 @@ check("PC 2 ne peut pas générer de code d'appairage (403/401)", c.post("/ui/pa
 
 # Préférences et mise en page présentes
 r = c.get("/ui", headers=OWN).text
-check("préférences : densité et sections repliables", "bouton-densite" in r and "data-memo=memoire" in r)
+check("préférences : densité et sections repliables", "bouton-densite" in r and "data-onglet=memoire" in r)
 check("mise en page : grille liste + détail", "fils-grille" in r and "fil-detail" in r and "zone-detail" in r)
 check("JS : préférences en localStorage avec try/catch", "iapartag-prefs" in r and "localStorage" in r)
 check("JS : copie avec retour Copié", "Copié" in r and "clipboard" in r)

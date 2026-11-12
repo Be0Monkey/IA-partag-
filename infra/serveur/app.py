@@ -226,13 +226,10 @@ def _sens(paires):
     if "A>B" in ps and "B>A" in ps: return "A ↔ B"
     return ", ".join(sorted(p.replace(">", " → ") for p in ps))
 
-def _garde_msg(m, q):
-    """Filtres de la liste de messages : urgents, à récupérer, expéditeur A ou B."""
-    f, s = q.get("filtre"), q.get("sens")
-    if f == "urgents" and m["priority"] != "urgente": return False
-    if f == "recuperer" and m["delivered"]: return False
-    if s in ("A", "B") and m["sender"] != s: return False
-    return True
+def couleur(s, r):
+    """Classe de couleur d'un message : moitié gauche = expéditeur, moitié droite = destinataire."""
+    if s in AGENTS and r in AGENTS: return f"c-{s}{r}"
+    return "c-neutre"
 
 def _cond_filtre(q):
     conds, args = [], []
@@ -242,13 +239,17 @@ def _cond_filtre(q):
     if s in ("A", "B"): conds.append("sender=?"); args.append(s)
     return (" AND ".join(conds) or "1=1"), args
 
+def _nombre(q, cle, defaut, mini=5, maxi=200):
+    try: return max(mini, min(maxi, int(q.get(cle, defaut))))
+    except ValueError: return defaut
+
 def filtres_bar(q):
     e = html.escape
     f, s = q.get("filtre", ""), q.get("sens", "")
     def lien(libelle, actif, nouveaux):
         etat = {k: v for k, v in {"filtre": nouveaux.get("filtre", f), "sens": nouveaux.get("sens", s)}.items() if v}
         cls = " class=actif aria-current=true" if actif else ""
-        return f"<a href='{e(url_with(q, **nouveaux))}' data-filtre='{e(urlencode(etat))}'{cls}>{libelle}</a>"
+        return f"<a href='{e(url_with(q, **nouveaux))}' data-filtre='{e(urlencode(etat))}' data-remplace='zone-fils'{cls}>{libelle}</a>"
     liens = [lien("Tous", not f and not s, {"filtre": None}),
              lien("Urgents", f == "urgents", {"filtre": "urgents"}),
              lien("À récupérer", f == "recuperer", {"filtre": "recuperer"}),
@@ -256,26 +257,47 @@ def filtres_bar(q):
              lien("Envoyés par B", s == "B", {"sens": "B"})]
     actifs = [x for x in (f, s) if x]
     actif_txt = f"<b>Filtre actif : {e(' + '.join(actifs))}</b> · " if actifs else ""
-    reset = f" · <a href='{e(url_with(q, filtre=None, sens=None, journal=None))}' data-filtre=''>Réinitialiser</a>" if actifs else ""
+    reset = (f" · <a href='{e(url_with(q, filtre=None, sens=None, nfils=None, nmsg=None))}' data-filtre='' data-remplace='zone-fils'>Réinitialiser</a>"
+             if actifs else "")
     return f"<p class=filtres>{actif_txt}{' · '.join(liens)}{reset}</p>"
 
 def fils_block(q):
     e = html.escape
     cond, args = _cond_filtre(q)
+    n = _nombre(q, "nfils", 20)
     with db() as c:
         lst = c.execute("SELECT thread, COUNT(*) n, MAX(id) mid, GROUP_CONCAT(DISTINCT sender || '>' || recipient) paires "
-                        f"FROM messages WHERE thread IN (SELECT thread FROM messages WHERE {cond}) GROUP BY thread ORDER BY mid DESC LIMIT 40", args).fetchall()
+                        f"FROM messages WHERE thread IN (SELECT thread FROM messages WHERE {cond}) GROUP BY thread ORDER BY mid DESC LIMIT ?",
+                        (*args, n + 1)).fetchall()
+        plus = len(lst) > n
         rows = ""
-        for t in lst:
+        for t in lst[:n]:
             dern = c.execute("SELECT created, sender, body FROM messages WHERE thread=? ORDER BY id DESC LIMIT 1", (t["thread"],)).fetchone()
             apercu = dern["body"][:80] + ("…" if len(dern["body"]) > 80 else "")
             bloque = " <span class='etiq critique'>bloqué</span>" if t["n"] >= MAX_PER_THREAD else ""
             sel = q.get("fil") == t["thread"]
-            rows += (f"<tr class='{'sel' if sel else ''}'><td><a href='{e(url_with(q, fil=t['thread']))}'{' aria-current=true' if sel else ''}>{e(t['thread'])}</a></td>"
+            rows += (f"<tr class='{'sel' if sel else ''}'><td><a href='{e(url_with(q, fil=t['thread']))}' data-remplace='zone-fils'{' aria-current=true' if sel else ''}>{e(t['thread'])}</a></td>"
                      f"<td>{e(_sens(t['paires']))}</td><td>{t['n']}/{MAX_PER_THREAD}{bloque}</td>"
                      f"<td><small>{e(dern['created'])} · {e(dern['sender'])}</small><br>{e(apercu)}</td></tr>")
-    return ("<h3>Fils de discussion (40 plus récents)</h3><div class=table-wrap><table><tr><th>fil<th>sens<th>messages<th>dernier message</tr>"
-            + (rows or "<tr><td colspan=4>aucun fil pour ce filtre</td></tr>") + "</table></div>")
+    voir = (f"<p><a href='{e(url_with(q, nfils=n + 20))}' data-remplace='zone-fils'>Voir plus de fils</a></p>" if plus else "")
+    return ("<h3>Fils de discussion</h3><div class=table-wrap><table><tr><th>fil<th>sens<th>messages<th>dernier message</tr>"
+            + (rows or "<tr><td colspan=4>aucun fil pour ce filtre</td></tr>") + "</table></div>" + voir)
+
+def messages_table(q):
+    e = html.escape
+    cond, args = _cond_filtre(q)
+    n = _nombre(q, "nmsg", 10)
+    with db() as c:
+        lignes = c.execute(f"SELECT * FROM messages WHERE {cond} ORDER BY id DESC LIMIT ?", (*args, n + 1)).fetchall()
+    plus = len(lignes) > n
+    rows = "".join(
+        f"<tr class='{couleur(m['sender'], m['recipient'])}'><td>{e(m['created'])}</td><td>{e(m['sender'])}→{e(m['recipient'])}</td>"
+        f"<td><a href='{e(url_with(q, fil=m['thread']))}' data-remplace='zone-fils'>{e(m['thread'])}</a></td>"
+        f"<td>{'Récupérée' if m['delivered'] else 'À récupérer'}</td><td>{e(m['priority'])}</td><td>{e(m['body'][:200])}</td></tr>"
+        for m in lignes[:n])
+    voir = (f"<p><a href='{e(url_with(q, nmsg=n + 10))}' data-remplace='zone-fils'>Voir plus de messages</a></p>" if plus else "")
+    return ("<h3>Messages récents</h3><div class=table-wrap><table><tr><th>date<th>sens<th>fil<th>état<th>prio<th>texte</tr>"
+            + rows + "</table></div>" + voir)
 
 def fil_detail(q, thread):
     e = html.escape
@@ -283,7 +305,7 @@ def fil_detail(q, thread):
         return "<h3>Détail du fil</h3><p>Choisis un fil dans la liste pour lire tous ses messages, dans l'ordre.</p>"
     with db() as c:
         msgs = c.execute("SELECT * FROM messages WHERE thread=? ORDER BY id", (thread,)).fetchall()
-    retour = f"<p><a href='{e(url_with(q, fil=None))}'>← fermer le fil</a></p>"
+    retour = f"<p><a href='{e(url_with(q, fil=None))}' data-remplace='zone-fils'>← fermer le fil</a></p>"
     if not msgs: return f"<h3>Fil introuvable</h3>{retour}<p>Aucun message dans le fil <b>{e(thread)}</b>.</p>"
     n = len(msgs)
     etat = " — <span class='etiq critique'>fil bloqué (anti-boucle)</span>" if n >= MAX_PER_THREAD else ""
@@ -291,7 +313,7 @@ def fil_detail(q, thread):
     entete = (f"<h3>Fil {e(thread)} : {n}/{MAX_PER_THREAD} messages{etat}</h3>"
               f"<p><button class='bouton b-bleu' type=button data-copie-lien='{lien}'>Copier le lien du fil</button></p>{retour}")
     items = "".join(
-        f"<div class=bloc><small>{e(m['created'])} · {e(m['sender'])} → {e(m['recipient'])} · {e(m['priority'])} · {'Récupérée' if m['delivered'] else 'À récupérer'}</small>"
+        f"<div class='bloc {couleur(m['sender'], m['recipient'])}'><small>{e(m['created'])} · {e(m['sender'])} → {e(m['recipient'])} · {e(m['priority'])} · {'Récupérée' if m['delivered'] else 'À récupérer'}</small>"
         f"<div style='white-space:pre-wrap;margin:6px 0'>{e(m['body'])}</div>"
         f"<button class='bouton b-gris' type=button data-copie-texte='{e(m['body'])}'>Copier le texte</button></div>" for m in msgs)
     return entete + items
@@ -312,7 +334,7 @@ def journal_block(q):
             m = re.search(r"fil (\S+) bloqué", x["detail"])
             if x["kind"] == "anti-boucle" and m:
                 n = c.execute("SELECT COUNT(*) n FROM messages WHERE thread=?", (m.group(1),)).fetchone()["n"]
-                extra = (f" · <a href='{e(url_with(q, fil=m.group(1)))}'>Voir le fil</a> · état actuel : {n}/{MAX_PER_THREAD}"
+                extra = (f" · <a href='{e(url_with(q, fil=m.group(1)))}' data-remplace='zone-fils' data-vers='fils'>Voir le fil</a> · état actuel : {n}/{MAX_PER_THREAD}"
                          + (" (toujours bloqué)" if n >= MAX_PER_THREAD else " (plus bloqué)"))
             elif (datetime.datetime.now() - datetime.datetime.fromisoformat(x["ts"])).total_seconds() > 600:
                 extra = " · <small>ancien (passé)</small>"
@@ -321,7 +343,7 @@ def journal_block(q):
         bandeau = f"<div class='resultat ko'>Échec de sauvegarde le {e(ko['ts'])} : {e(ko['detail'])}. Dernière sauvegarde réussie : {e(ok['ts'] if ok else 'aucune')}.</div>"
     else:
         bandeau = f"<p>Dernière sauvegarde réussie : <b>{e(ok['ts'] if ok else 'aucune')}</b> ({ago(ok['ts'] if ok else None)})</p>"
-    filtres = (f"<p><a href='{e(url_with(q, journal=None))}'>Tout</a> · <a href='{e(url_with(q, journal='incidents'))}'>Incidents</a> "
+    filtres = (f"<p><a href='{e(url_with(q, journal=None))}' data-remplace='zone-journal'>Tout</a> · <a href='{e(url_with(q, journal='incidents'))}' data-remplace='zone-journal'>Incidents</a> "
                f"· affichage : <b>{'incidents' if incidents else 'tout'}</b></p>")
     return (f"<h3>Journal d'événements</h3>{bandeau}{filtres}<div class=table-wrap><table><tr><th>date<th>type<th>détail</tr>"
             + (rows or "<tr><td colspan=3>aucun</td></tr>") + "</table></div>")
@@ -329,11 +351,13 @@ def journal_block(q):
 CSS = """
 :root{--bg:#111;--fg:#eee;--line:#333;--card:#1b1b1b;--muted:#9aa0a6;--A:#7DD3FC;--B:#C4B5FD;--ok:#1a7f37;--ko:#b62324;--btn:#1f6feb}
 *{box-sizing:border-box}
+[hidden]{display:none !important}
 body{font:14px system-ui,sans-serif;margin:0;padding:16px;background:var(--bg);color:var(--fg)}
 a{color:#8ab4ff}
 h2{margin:0 0 4px;font-size:20px} h3{margin:18px 0 8px;font-size:16px}
 header.top{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);padding-bottom:10px}
 header.top .meta{color:var(--muted);font-size:13px}
+.liens{font-size:13px;margin-top:6px}
 .cards{display:flex;flex-wrap:wrap;gap:12px;margin:14px 0}
 .carte{flex:1 1 280px;min-width:0;border:2px solid var(--line);border-radius:10px;padding:12px;background:var(--card)}
 .carte.A{border-color:var(--A)} .carte.B{border-color:var(--B)}
@@ -352,22 +376,30 @@ input.note,input.cherche{width:100%;max-width:340px;padding:6px;background:#0d0d
 .banniere.on{display:block}
 .resultat{background:#1e2d1e;border:1px solid var(--ok);border-radius:8px;padding:10px;margin:10px 0}
 .resultat.ko{background:#2d1e1e;border-color:var(--ko)}
+.onglets{display:flex;gap:4px;flex-wrap:wrap;border-bottom:1px solid #444;margin-top:14px}
+.onglets button{background:#222;color:#ddd;border:1px solid #444;border-bottom:0;padding:8px 14px;border-radius:8px 8px 0 0;cursor:pointer;font:inherit}
+.onglets button.actif{background:var(--card);color:#fff;font-weight:700}
 .filtres{margin:6px 0 10px}
 .filtres a.actif{font-weight:700;color:#fff;text-decoration:underline}
-.table-wrap{overflow-x:auto;margin:8px 0 20px}
+.table-wrap{overflow-x:auto;margin:8px 0 12px}
 table{border-collapse:collapse;width:100%}
 td,th{border-bottom:1px solid #333;padding:4px 8px;text-align:left;vertical-align:top;word-break:break-word}
 th{color:var(--muted);font-weight:600}
 tr.sel td{background:#1d2a3a}
 small,.petit{color:var(--muted)}
-details{margin:6px 0}
-summary{cursor:pointer;font-weight:600;padding:4px 0}
 .fils-grille{display:grid;grid-template-columns:1fr;gap:12px;align-items:start}
 .fils-grille>div{min-width:0}
 @media (min-width:1000px){.fils-grille{grid-template-columns:minmax(340px,1fr) minmax(0,2fr)}}
 #ligne-detail>td{padding:8px 0;border-bottom:0}
 .valeur{white-space:pre-wrap;word-break:break-word;max-height:220px;overflow:auto;background:#0d0d0d;border:1px solid #333;border-radius:6px;padding:6px;margin:0;font:13px ui-monospace,monospace}
 .diff-plus{color:#7ee787} .diff-moins{color:#ff9b9b}
+/* Couleurs des messages : moitié gauche = expéditeur, moitié droite = destinataire */
+.bloc.c-AB,tr.c-AB{background:linear-gradient(90deg,var(--A) 50%,var(--B) 50%)}
+.bloc.c-BA,tr.c-BA{background:linear-gradient(90deg,var(--B) 50%,var(--A) 50%)}
+.bloc.c-neutre,tr.c-neutre{background:#3a3a3a}
+.bloc.c-AB,.bloc.c-BA,tr.c-AB td,tr.c-BA td{color:#111;background:transparent}
+.bloc.c-AB small,.bloc.c-BA small,tr.c-AB small,tr.c-BA small{color:#333}
+tr.c-AB td,tr.c-BA td{border-bottom-color:#999}
 body.compact td,body.compact th{padding:2px 6px}
 body.compact .bloc{padding:6px 8px;margin:6px 0}
 @media (max-width:640px){body{padding:12px 16px}.carte{flex-basis:100%}}
@@ -389,7 +421,7 @@ JS = """
   function sauverPrefs() { try { localStorage.setItem('iapartag-prefs', JSON.stringify(prefs)); } catch (x) {} }
   try { pauseManuelle = sessionStorage.getItem('iapartag-pause') === '1'; } catch (x) {}
 
-  // Préférences : densité, sections repliées, dernier filtre de messages (mémorisées par navigateur)
+  // Densité et dernier filtre de messages (mémorisés par navigateur)
   function majDensite() {
     document.body.classList.toggle('compact', prefs.densite === 'compacte');
     if (boutonDensite) boutonDensite.textContent = prefs.densite === 'compacte' ? 'Densité : compacte' : 'Densité : normale';
@@ -398,17 +430,6 @@ JS = """
     prefs.densite = prefs.densite === 'compacte' ? 'normale' : 'compacte'; sauverPrefs(); majDensite();
   });
   majDensite();
-  prefs.sections = prefs.sections || {};
-  document.querySelectorAll('details[data-memo]').forEach(function (d) {
-    var id = d.getAttribute('data-memo');
-    if (prefs.sections[id] === 'ferme') d.removeAttribute('open');
-    else if (prefs.sections[id] === 'ouvert') d.setAttribute('open', '');
-    d.addEventListener('toggle', function () { prefs.sections[id] = d.open ? 'ouvert' : 'ferme'; sauverPrefs(); });
-  });
-  document.addEventListener('click', function (ev) {
-    var a = ev.target.closest ? ev.target.closest('a[data-filtre]') : null;
-    if (a) { prefs.filtre = a.getAttribute('data-filtre'); sauverPrefs(); }
-  });
   try {
     var dejaApplique = sessionStorage.getItem('iapartag-filtre-applique') === '1';
     if (!dejaApplique && !/[?&](filtre|sens)=/.test(location.search) && prefs.filtre) {
@@ -416,6 +437,88 @@ JS = """
       location.replace('/ui?' + prefs.filtre);
     }
   } catch (x) {}
+
+  // Onglets : le dernier onglet ouvert est retenu
+  function activerOnglet(id) {
+    document.querySelectorAll('button[data-onglet]').forEach(function (b) {
+      var on = b.getAttribute('data-onglet') === id;
+      b.setAttribute('aria-selected', on ? 'true' : 'false');
+      b.classList.toggle('actif', on);
+    });
+    document.querySelectorAll('[data-panneau]').forEach(function (s) {
+      s.hidden = s.getAttribute('data-panneau') !== id;
+    });
+    prefs.onglet = id; sauverPrefs();
+  }
+  document.querySelectorAll('button[data-onglet]').forEach(function (b) {
+    b.addEventListener('click', function () { activerOnglet(b.getAttribute('data-onglet')); });
+  });
+  var depart = prefs.onglet;
+  if (!depart || !document.querySelector('button[data-onglet="' + depart + '"]')) depart = 'fils';
+  activerOnglet(depart);
+
+  // Remplacement d'une zone sans recharger la page : la position de défilement est conservée
+  function placerDetail() {
+    var d = document.getElementById('fil-detail'), zone = document.getElementById('zone-detail');
+    if (!d || !zone) return;
+    var ligne = document.getElementById('ligne-detail');
+    var sel = document.querySelector('tr.sel');
+    if (window.matchMedia('(max-width: 999px)').matches && sel) {
+      if (!ligne) {
+        ligne = document.createElement('tr'); ligne.id = 'ligne-detail';
+        var td = document.createElement('td'); td.colSpan = 4; ligne.appendChild(td);
+      }
+      sel.parentNode.insertBefore(ligne, sel.nextSibling);
+      ligne.firstChild.appendChild(d);
+    } else {
+      zone.appendChild(d);
+      if (ligne && ligne.parentNode) ligne.parentNode.removeChild(ligne);
+    }
+  }
+  function appliquer(doc, zones) {
+    zones.forEach(function (id) {
+      var neuf = doc.getElementById(id), vieux = document.getElementById(id);
+      if (neuf && vieux) vieux.innerHTML = neuf.innerHTML;
+    });
+    placerDetail();
+  }
+  function chargerZone(url, zones, focusId, lienHref) {
+    fetch(url, {cache: 'no-store', credentials: 'same-origin'}).then(function (r) {
+      if (!r.ok) throw new Error('http');
+      return r.text();
+    }).then(function (t) {
+      appliquer(new DOMParser().parseFromString(t, 'text/html'), zones);
+      try { history.replaceState(null, '', url); } catch (x) {}
+      var el = focusId ? document.getElementById(focusId) : null;
+      if (!el && lienHref) {
+        var liens = document.querySelectorAll('a[data-remplace]');
+        for (var i = 0; i < liens.length; i++) if (liens[i].getAttribute('href') === lienHref) { el = liens[i]; break; }
+      }
+      if (el && el.focus) el.focus({preventScroll: true});
+    }).catch(function () { location.href = url; });
+  }
+  document.addEventListener('click', function (ev) {
+    if (ev.defaultPrevented || ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.button) return;
+    var a = ev.target.closest ? ev.target.closest('a[data-remplace]') : null;
+    if (a) {
+      ev.preventDefault();
+      if (a.hasAttribute('data-filtre')) { prefs.filtre = a.getAttribute('data-filtre'); sauverPrefs(); }
+      if (a.getAttribute('data-vers')) activerOnglet(a.getAttribute('data-vers'));
+      chargerZone(a.getAttribute('href'), a.getAttribute('data-remplace').split(' '), null, a.getAttribute('href'));
+      return;
+    }
+    var f = ev.target.closest ? ev.target.closest('a[data-filtre]') : null;
+    if (f) { prefs.filtre = f.getAttribute('data-filtre'); sauverPrefs(); }
+    var b = ev.target.closest ? ev.target.closest('[data-copie-lien],[data-copie-texte]') : null;
+    if (b) copier(b.hasAttribute('data-copie-lien') ? location.origin + b.getAttribute('data-copie-lien') : b.getAttribute('data-copie-texte'), b);
+  });
+  document.addEventListener('submit', function (ev) {
+    var form = ev.target;
+    if (!form || !form.hasAttribute || !form.hasAttribute('data-remplace')) return;
+    ev.preventDefault();
+    var params = new URLSearchParams(new FormData(form)).toString();
+    chargerZone(form.getAttribute('action') + '?' + params, form.getAttribute('data-remplace').split(' '), form.getAttribute('data-focus'), null);
+  });
 
   // Copie : lien du fil ou texte d'un message, avec retour « Copié »
   function repli(texte) {
@@ -434,35 +537,11 @@ JS = """
       navigator.clipboard.writeText(texte).then(fait, function () { repli(texte); fait(); });
     } else { repli(texte); fait(); }
   }
-  document.addEventListener('click', function (ev) {
-    var b = ev.target.closest ? ev.target.closest('[data-copie-lien],[data-copie-texte]') : null;
-    if (!b) return;
-    var texte = b.hasAttribute('data-copie-lien') ? location.origin + b.getAttribute('data-copie-lien') : b.getAttribute('data-copie-texte');
-    copier(texte, b);
-  });
-
-  // Sur écran étroit, le détail du fil se place sous la ligne sélectionnée ; sinon à droite de la liste
-  function placerDetail() {
-    var d = document.getElementById('fil-detail'), zone = document.getElementById('zone-detail');
-    if (!d || !zone) return;
-    var ligne = document.getElementById('ligne-detail');
-    var sel = document.querySelector('tr.sel');
-    if (window.matchMedia('(max-width: 999px)').matches && sel) {
-      if (!ligne) {
-        ligne = document.createElement('tr'); ligne.id = 'ligne-detail';
-        var td = document.createElement('td'); td.colSpan = 4; ligne.appendChild(td);
-      }
-      sel.parentNode.insertBefore(ligne, sel.nextSibling);
-      ligne.firstChild.appendChild(d);
-    } else {
-      zone.appendChild(d);
-      if (ligne && ligne.parentNode) ligne.parentNode.removeChild(ligne);
-    }
-  }
-  placerDetail();
   var tRedim = null;
   window.addEventListener('resize', function () { clearTimeout(tRedim); tRedim = setTimeout(placerDetail, 150); });
+  placerDetail();
 
+  // Actualisation légère, pause pendant la saisie
   function saisie() {
     var el = document.activeElement;
     if (el && (el.tagName === 'TEXTAREA' || (el.tagName === 'INPUT' && /^(text|search|password|number)$/.test(el.type)))) return true;
@@ -491,8 +570,8 @@ JS = """
     var y = sessionStorage.getItem('iapartag-defilement');
     if (y !== null) {
       window.scrollTo(0, +y); sessionStorage.removeItem('iapartag-defilement');
-      var f = sessionStorage.getItem('iapartag-focus'); sessionStorage.removeItem('iapartag-focus');
-      var el = f ? document.getElementById(f) : null;
+      var f2 = sessionStorage.getItem('iapartag-focus'); sessionStorage.removeItem('iapartag-focus');
+      var el = f2 ? document.getElementById(f2) : null;
       if (el && el.focus) el.focus({preventScroll: true});
     }
   } catch (x) {}
@@ -500,7 +579,6 @@ JS = """
     var c = document.getElementById('compteur-' + n.dataset.id);
     n.addEventListener('input', function () { if (c) c.textContent = n.value.length + ' / 300'; });
   });
-
   function tick() {
     var raison = pauseManuelle ? 'Actualisation en pause (manuelle)' : (saisie() ? 'Actualisation en pause : saisie en cours' : null);
     if (raison) return afficherStatut(raison + ' — la saisie est conservée.');
@@ -561,15 +639,17 @@ async def ui(req: Request):
     role = human_role(req)
     if not role:
         return Response("Authentification requise", status_code=401, headers={"WWW-Authenticate": 'Basic realm="IA-partag"'})
-    ags, msgs, _, unread = state(); e = html.escape
+    ags, _, _, unread = state(); e = html.escape
     q = dict(req.query_params)
-    msgs = [m for m in msgs if _garde_msg(m, q)]
     with db() as c:
         cmax = c.execute("SELECT COALESCE(MAX(id),0) m FROM messages").fetchone()["m"]
         emax = c.execute("SELECT COALESCE(MAX(id),0) m FROM events").fetchone()["m"]
         ap = c.execute("SELECT COUNT(*) n, COALESCE(MAX(id),0) m FROM approvals WHERE status='en attente'").fetchone()
-    rows = "".join(f"<tr><td>{e(m['created'])}</td><td>{e(m['sender'])}→{e(m['recipient'])}</td><td><a href='{e(url_with(q, fil=m['thread']))}'>{e(m['thread'])}</a></td><td>{'Récupérée' if m['delivered'] else 'À récupérer'}</td><td>{e(m['priority'])}</td><td>{e(m['body'][:200])}</td></tr>" for m in msgs)
-    entete = (f"<header class=top><div><h2>IA-partag — suivi</h2><span class=meta>Connecté : <b>{e(_libelle_role(role))}</b></span></div>"
+    proprietaire = role == "owner"
+    liens = ("<nav class=liens aria-label='Liens utiles'>Liens utiles : "
+             "<a href='https://github.com/Be0Monkey/IA-partag-' target=_blank rel=noopener>Dépôt</a> · "
+             "<a href='https://github.com/Be0Monkey/IA-partag-/pulls' target=_blank rel=noopener>Pull requests</a></nav>")
+    entete = (f"<header class=top><div><h2>IA-partag — suivi</h2><span class=meta>Connecté : <b>{e(_libelle_role(role))}</b></span>{liens}</div>"
               f"<div class=meta>Dernière actualisation : <span id=heure-maj>{now()[11:]}</span> · <span id=statut-maj>Actualisation automatique</span><br>"
               "<button id=bouton-pause class='bouton b-gris' type=button aria-pressed=false>Pause</button> "
               "<button id=bouton-densite class='bouton b-gris' type=button>Densité : normale</button></div></header>"
@@ -577,15 +657,24 @@ async def ui(req: Request):
               "<div id=banniere class=banniere role=status><span id=banniere-texte>Nouveautés disponibles.</span> "
               "<button class='bouton b-bleu' type=button onclick='iapartagRecharger()'>Afficher</button></div>")
     fil = q.get("fil", "")[:100]
-    appr = approvals_block(role) + ((pairing_block() + invite_block()) if role == "owner" else "")
-    corps_fil = (f"<div class=fils-grille><div id=liste-fils>{fils_block(q)}</div>"
-                 f"<div id=zone-detail><div id=fil-detail>{fil_detail(q, fil)}</div></div></div>")
-    body = (f"{entete}{res_banner(q)}<div class=cards>{cartes_block(ags, unread)}</div>{appr}"
-            f"<h3>Fils et messages</h3>{filtres_bar(q)}{corps_fil}"
-            f"<details open data-memo=messages><summary>Messages (30 derniers)</summary><div class=table-wrap><table><tr><th>date<th>sens<th>fil<th>état<th>prio<th>texte</tr>{rows}</table></div></details>"
-            f"<details open data-memo=memoire><summary>Mémoire partagée (lecture seule)</summary>{memory_block(q)}</details>"
-            f"<details open data-memo=journal><summary>Journal et sauvegardes</summary>{journal_block(q)}</details>"
-            f"<small>Affichage : {now()}</small>")
+    # Permanent : cartes et « À traiter » restent visibles quel que soit l'onglet
+    permanent = (f"{res_banner(q)}<div id=zone-cartes class=cards>{cartes_block(ags, unread)}</div>"
+                 f"<div id=zone-traiter>{traiter_block(role)}</div>")
+    zone_fils = (f"<div id=zone-fils>{filtres_bar(q)}<div class=fils-grille><div id=liste-fils>{fils_block(q)}</div>"
+                 f"<div id=zone-detail><div id=fil-detail>{fil_detail(q, fil)}</div></div></div>{messages_table(q)}</div>")
+    zone_memoire = f"<div id=zone-memoire>{memory_block(q)}</div>"
+    zone_journal = f"<div id=zone-journal>{historique_block()}{journal_block(q)}</div>"
+    onglets = ("<nav class=onglets role=tablist aria-label='Sections'>"
+               "<button role=tab data-onglet=fils>Fils et messages</button>"
+               "<button role=tab data-onglet=memoire>Mémoire</button>"
+               "<button role=tab data-onglet=journal>Journal</button>"
+               + ("<button role=tab data-onglet=admin>Administration</button>" if proprietaire else "") + "</nav>")
+    panneaux = (f"<section data-panneau=fils>{zone_fils}</section>"
+                f"<section data-panneau=memoire hidden>{zone_memoire}</section>"
+                f"<section data-panneau=journal hidden>{zone_journal}</section>")
+    if proprietaire:
+        panneaux += f"<section data-panneau=admin hidden><div id=zone-admin>{pairing_block()}{invite_block()}</div></section>"
+    body = f"{entete}{permanent}{onglets}{panneaux}<small>Affichage : {now()}</small>"
     return HTMLResponse(_page(body))
 
 def blocked_page(exc):
@@ -673,13 +762,12 @@ def _echeance(created):
     if reste <= 0: return f"échéance {fin:%d/%m %H:%M} (dépassée)"
     return f"échéance {fin:%d/%m %H:%M} (reste {reste // 60} h {reste % 60:02d})"
 
-def approvals_block(role="owner"):
+def traiter_block(role="owner"):
+    """Bloc permanent : « À traiter » et demandes en attente (ce que le rôle peut trancher en premier)."""
     e = html.escape
     with db() as c:
         expire(c)
         pend = c.execute("SELECT * FROM approvals WHERE status='en attente' ORDER BY id").fetchall()
-        hist = c.execute("SELECT * FROM approvals WHERE status!='en attente' ORDER BY id DESC LIMIT 15").fetchall()
-    # Bloc « À traiter » : ce que le rôle connecté peut trancher, les plus proches de l'échéance d'abord
     a_traiter = [a for a in pend if _peut_trancher(role, a)]
     out = "<div class='bloc urgent' id=a-traiter><h3 style='margin-top:0'>À traiter</h3>"
     if not a_traiter: out += "<p>Aucune décision attendue de toi.</p>"
@@ -701,10 +789,16 @@ def approvals_block(role="owner"):
                     f"<button class='bouton b-ko' name=decision value=deny>Refuser</button></form></div>")
         else:
             out += "<p><i>Décision réservée au propriétaire.</i></p></div>"
-    rows = "".join(f"<tr><td>#{a['id']}</td><td>{e(a['requester'])}</td><td>{e(a['level'] or 'local')}</td><td>{e(a['action'])}</td><td>{e(a['status'])}</td><td>{e(a['decided_by'] or 'non renseigné')}</td><td>{e(a['decided'] or '')}</td><td>{e(a['note'] or '')}</td></tr>" for a in hist)
-    out += ("<h3>Historique des validations</h3><div class=table-wrap><table><tr><th>n°<th>de<th>niveau<th>action<th>décision<th>décidée par<th>date<th>note</tr>"
-            + (rows or "<tr><td colspan=8>aucune</td></tr>") + "</table></div>")
     return out
+
+def historique_block():
+    """Historique des validations, rangé dans l'onglet Journal."""
+    e = html.escape
+    with db() as c:
+        hist = c.execute("SELECT * FROM approvals WHERE status!='en attente' ORDER BY id DESC LIMIT 15").fetchall()
+    rows = "".join(f"<tr><td>#{a['id']}</td><td>{e(a['requester'])}</td><td>{e(a['level'] or 'local')}</td><td>{e(a['action'])}</td><td>{e(a['status'])}</td><td>{e(a['decided_by'] or 'non renseigné')}</td><td>{e(a['decided'] or '')}</td><td>{e(a['note'] or '')}</td></tr>" for a in hist)
+    return ("<h3>Historique des validations</h3><div class=table-wrap><table><tr><th>n°<th>de<th>niveau<th>action<th>décision<th>décidée par<th>date<th>note</tr>"
+            + (rows or "<tr><td colspan=8>aucune</td></tr>") + "</table></div>")
 
 PAIR_TTL_MIN = 10          # validité d'un code d'appairage
 PAIR_MAX_FAILS = 5         # échecs max par fenêtre de 10 min, tous clients confondus
@@ -922,10 +1016,10 @@ def memory_block(q):
     body = "".join(
         f"<tr><td>{e(r['key'])}</td><td>v{r['version']}</td><td>{e(r['author'])}</td><td>{e(r['updated'])}</td>"
         f"<td><pre class=valeur>{e(r['value'])}</pre></td></tr>" for r in rows)
-    recherche = (f"<form method=get action=/ui><label for=mem>Chercher une clé</label> "
+    recherche = (f"<form method=get action=/ui data-remplace='zone-memoire' data-focus=mem><label for=mem>Chercher une clé</label> "
                  f"<input class=cherche id=mem name=mem value='{e(mem)}' maxlength=100> <button class='bouton b-gris'>Chercher</button>"
                  + (f" <a href='{e(url_with(q, mem=None))}'>Effacer la recherche</a>" if mem else "") + "</form>")
-    comparaison = (f"<form method=get action=/ui style='margin-top:10px'><label for=cle>Comparer deux versions d'une clé</label> "
+    comparaison = (f"<form method=get action=/ui style='margin-top:10px' data-remplace='zone-memoire' data-focus=cle><label for=cle>Comparer deux versions d'une clé</label> "
                    f"<input class=cherche id=cle name=cle value='{e(cle)}' maxlength=100 style='max-width:200px'> "
                    "v <input name=v1 type=number min=1 style='width:70px'> → v <input name=v2 type=number min=1 style='width:70px'> "
                    "<button class='bouton b-gris'>Comparer</button></form>")
