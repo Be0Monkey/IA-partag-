@@ -65,6 +65,19 @@ Le serveur écoute sur `host:port` (routes `/send`, `/inbox`, `/heartbeat`, `/st
 
 Arrêt : interrompre le processus (Ctrl+C), ou arrêter le processus qui écoute sur le port.
 
+## Tests de `/ui`
+
+Les tests tournent sur une copie temporaire (jamais sur la vraie base) et ne demandent aucune dépendance supplémentaire. Depuis `infra/` :
+
+```bash
+python serveur/tests/lot1_check.py serveur/app.py
+python serveur/tests/lot2_check.py serveur/app.py
+python serveur/tests/lot3_check.py serveur/app.py
+python serveur/tests/routes_check.py serveur/app.py sortie.json
+```
+
+`routes_check.py` écrit dans `sortie.json` le code HTTP de chaque route ; le comparer avec la version précédente permet de vérifier que messages, mémoire, validations et appairage répondent comme avant. Le comportement du JavaScript de `/ui` (actualisation, copie, préférences) n'est pas couvert par ces tests : il se vérifie dans le navigateur.
+
 ## Restauration
 
 ```bash
