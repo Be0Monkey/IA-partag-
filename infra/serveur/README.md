@@ -73,6 +73,7 @@ Les tests tournent sur une copie temporaire (jamais sur la vraie base) et ne dem
 python serveur/tests/lot1_check.py serveur/app.py
 python serveur/tests/lot2_check.py serveur/app.py
 python serveur/tests/lot3_check.py serveur/app.py
+python serveur/tests/lot4_check.py serveur/app.py
 python serveur/tests/routes_check.py serveur/app.py sortie.json
 ```
 
