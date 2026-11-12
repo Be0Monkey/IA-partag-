@@ -88,7 +88,7 @@ check("PC 2 ne peut pas générer de code d'appairage (403/401)", c.post("/ui/pa
 # Préférences et mise en page présentes
 r = c.get("/ui", headers=OWN).text
 check("préférences : densité et sections repliables", "bouton-densite" in r and "data-onglet=memoire" in r)
-check("mise en page : grille liste + détail", "fils-grille" in r and "fil-detail" in r and "zone-detail" in r)
+check("mise en page : grille liste + détail", "fils-grille" in r and "zone-messages" in r)
 check("JS : préférences en localStorage avec try/catch", "iapartag-prefs" in r and "localStorage" in r)
 check("JS : copie avec retour Copié", "Copié" in r and "clipboard" in r)
 check("aucune restriction de lecture PC 2 sur /ui/etat", c.get("/ui/etat?depuis=0", headers=pc2).status_code == 200)
