@@ -1,7 +1,7 @@
 import re
 """Serveur central IA-partag (phase 0) : messages, présence, auth par jeton, interface de suivi minimale."""
 import base64, datetime, hashlib, hmac, html, json, logging, math, pathlib, secrets, sqlite3, sys
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote, urlencode
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -180,12 +180,109 @@ async def ui_state(req: Request):
     """Résumé léger pour l'actualisation de /ui : sert à détecter les nouveautés sans recharger la page."""
     role = human_role(req)
     if not role: return JSONResponse({"erreur": "non autorisé"}, status_code=401)
+    try: depuis = int(req.query_params.get("depuis", "0"))
+    except ValueError: depuis = 0
     with db() as c:
         expire(c)
         m = c.execute("SELECT COALESCE(MAX(id),0) m FROM messages").fetchone()["m"]
+        nouv = c.execute("SELECT COUNT(*) n FROM messages WHERE id>?", (depuis,)).fetchone()["n"]
         e = c.execute("SELECT COALESCE(MAX(id),0) m FROM events").fetchone()["m"]
         ap = c.execute("SELECT COUNT(*) n, COALESCE(MAX(id),0) m FROM approvals WHERE status='en attente'").fetchone()
-    return JSONResponse({"messages": m, "evenements": e, "en_attente": ap["n"], "derniere_demande": ap["m"]})
+    return JSONResponse({"messages": m, "nouveaux_messages": nouv, "evenements": e, "en_attente": ap["n"], "derniere_demande": ap["m"]})
+
+def ago(ts):
+    """Âge lisible d'un horodatage ISO (« il y a 3 min »)."""
+    if not ts: return "jamais"
+    s = (datetime.datetime.now() - datetime.datetime.fromisoformat(ts)).total_seconds()
+    if s < 60: return f"il y a {max(0, int(s))} s"
+    if s < 3600: return f"il y a {int(s // 60)} min"
+    if s < 86400: return f"il y a {int(s // 3600)} h {int(s % 3600 // 60):02d} min"
+    return f"il y a {int(s // 86400)} j"
+
+INCIDENTS = ("anti-boucle", "limite", "humain-échec", "appairage-échec", "invitation-échec", "validation-refusée", "memoire-refusée", "sauvegarde-échec")
+
+def url_with(q, **kw):
+    """Adresse de /ui avec les paramètres courants (filtres, fil ouvert) plus les changements demandés."""
+    d = dict(q); d.update(kw)
+    return "/ui?" + urlencode({k: v for k, v in d.items() if v})
+
+def cartes_block(ags, unread):
+    e = html.escape
+    with db() as c:
+        oldest = {r["recipient"]: r["t"] for r in c.execute("SELECT recipient, MIN(created) t FROM messages WHERE delivered IS NULL GROUP BY recipient")}
+        pend = {r["requester"]: r["n"] for r in c.execute("SELECT requester, COUNT(*) n FROM approvals WHERE status='en attente' GROUP BY requester")}
+    out = ""
+    for a in AGENTS:
+        v = ags[a]; n = unread.get(a, 0)
+        recup = f" (le plus ancien : {ago(oldest[a])})" if n else ""
+        out += (f"<div class='carte {a}'><span class='badge {a}'>{a}</span> <b>Claude {a}</b> — {'🟢 connecté' if v['connecte'] else '🔴 hors ligne'}<br>"
+                f"<small>Dernier contact : {ago(v['vu'])} ({e(v['vu'] or 'jamais')})</small><br>"
+                f"Messages à récupérer : <b>{n}</b>{e(recup)}<br>"
+                f"<small>Demandes de validation en attente : {pend.get(a, 0)}/{MAX_PENDING}</small></div>")
+    return out
+
+def _sens(paires):
+    ps = set(p for p in (paires or "").split(",") if p)
+    if "A>B" in ps and "B>A" in ps: return "A ↔ B"
+    return ", ".join(sorted(p.replace(">", " → ") for p in ps))
+
+def fils_block(q):
+    e = html.escape
+    with db() as c:
+        lst = c.execute("SELECT thread, COUNT(*) n, MAX(id) mid, GROUP_CONCAT(DISTINCT sender || '>' || recipient) paires "
+                        "FROM messages GROUP BY thread ORDER BY mid DESC LIMIT 40").fetchall()
+        rows = ""
+        for t in lst:
+            dern = c.execute("SELECT created, sender, body FROM messages WHERE thread=? ORDER BY id DESC LIMIT 1", (t["thread"],)).fetchone()
+            apercu = dern["body"][:80] + ("…" if len(dern["body"]) > 80 else "")
+            bloque = " <span class='etiq critique'>bloqué</span>" if t["n"] >= MAX_PER_THREAD else ""
+            rows += (f"<tr><td><a href='{e(url_with(q, fil=t['thread']))}'>{e(t['thread'])}</a></td><td>{e(_sens(t['paires']))}</td>"
+                     f"<td>{t['n']}/{MAX_PER_THREAD}{bloque}</td><td><small>{e(dern['created'])} · {e(dern['sender'])}</small><br>{e(apercu)}</td></tr>")
+    return ("<h3>Fils de discussion (40 plus récents)</h3><div class=table-wrap><table><tr><th>fil<th>sens<th>messages<th>dernier message</tr>"
+            + (rows or "<tr><td colspan=4>aucun fil</td></tr>") + "</table></div>")
+
+def fil_detail(q, thread):
+    e = html.escape
+    with db() as c:
+        msgs = c.execute("SELECT * FROM messages WHERE thread=? ORDER BY id", (thread,)).fetchall()
+    retour = f"<p><a href='{e(url_with(q, fil=None))}'>← retour à la liste des fils</a></p>"
+    if not msgs: return f"<h3>Fil introuvable</h3>{retour}<p>Aucun message dans le fil <b>{e(thread)}</b>.</p>"
+    n = len(msgs)
+    etat = f" — <span class='etiq critique'>fil bloqué (anti-boucle)</span>" if n >= MAX_PER_THREAD else ""
+    items = "".join(
+        f"<div class=bloc><small>{e(m['created'])} · {e(m['sender'])} → {e(m['recipient'])} · {e(m['priority'])} · {'Récupérée' if m['delivered'] else 'À récupérer'}</small>"
+        f"<div style='white-space:pre-wrap;margin-top:6px'>{e(m['body'])}</div></div>" for m in msgs)
+    return f"<h3>Fil {e(thread)} : {n}/{MAX_PER_THREAD} messages{etat}</h3>{retour}{items}"
+
+def journal_block(q):
+    e = html.escape
+    incidents = q.get("journal") == "incidents"
+    with db() as c:
+        if incidents:
+            evs = c.execute(f"SELECT * FROM events WHERE kind IN ({','.join('?' * len(INCIDENTS))}) ORDER BY id DESC LIMIT 30", INCIDENTS).fetchall()
+        else:
+            evs = c.execute("SELECT * FROM events ORDER BY id DESC LIMIT 15").fetchall()
+        ok = c.execute("SELECT ts FROM events WHERE kind='sauvegarde' AND detail LIKE 'copie de la base%' ORDER BY id DESC LIMIT 1").fetchone()
+        ko = c.execute("SELECT ts, detail FROM events WHERE kind='sauvegarde-échec' ORDER BY id DESC LIMIT 1").fetchone()
+        rows = ""
+        for x in evs:
+            detail = e(x["detail"]); extra = ""
+            m = re.search(r"fil (\S+) bloqué", x["detail"])
+            if x["kind"] == "anti-boucle" and m:
+                n = c.execute("SELECT COUNT(*) n FROM messages WHERE thread=?", (m.group(1),)).fetchone()["n"]
+                extra = (f" · <a href='{e(url_with(q, fil=m.group(1)))}'>Voir le fil</a> · état actuel : {n}/{MAX_PER_THREAD}"
+                         + (" (toujours bloqué)" if n >= MAX_PER_THREAD else " (plus bloqué)"))
+            elif (datetime.datetime.now() - datetime.datetime.fromisoformat(x["ts"])).total_seconds() > 600:
+                extra = " · <small>ancien (passé)</small>"
+            rows += f"<tr><td>{e(x['ts'])}</td><td>{e(x['kind'])}</td><td>{detail}{extra}</td></tr>"
+    if ko and (not ok or ko["ts"] > ok["ts"]):
+        bandeau = f"<div class='resultat ko'>Échec de sauvegarde le {e(ko['ts'])} : {e(ko['detail'])}. Dernière sauvegarde réussie : {e(ok['ts'] if ok else 'aucune')}.</div>"
+    else:
+        bandeau = f"<p>Dernière sauvegarde réussie : <b>{e(ok['ts'] if ok else 'aucune')}</b> ({ago(ok['ts'] if ok else None)})</p>"
+    filtres = (f"<p><a href='{e(url_with(q, journal=None))}'>Tout</a> · <a href='{e(url_with(q, journal='incidents'))}'>Incidents</a> "
+               f"· affichage : <b>{'incidents' if incidents else 'tout'}</b></p>")
+    return (f"<h3>Journal d'événements</h3>{bandeau}{filtres}<div class=table-wrap><table><tr><th>date<th>type<th>détail</tr>"
+            + (rows or "<tr><td colspan=3>aucun</td></tr>") + "</table></div>")
 
 CSS = """
 :root{--bg:#111;--fg:#eee;--line:#333;--card:#1b1b1b;--muted:#9aa0a6;--A:#7DD3FC;--B:#C4B5FD;--ok:#1a7f37;--ko:#b62324;--btn:#1f6feb}
@@ -230,6 +327,7 @@ JS = """
   var statut = document.getElementById('statut-maj');
   var heure = document.getElementById('heure-maj');
   var banniere = document.getElementById('banniere');
+  var banniereTexte = document.getElementById('banniere-texte');
   var base = st ? {m: +st.dataset.messages, e: +st.dataset.evenements, n: +st.dataset.enattente, d: +st.dataset.derniere} : null;
   var pauseManuelle = false;
   try { pauseManuelle = sessionStorage.getItem('iapartag-pause') === '1'; } catch (x) {}
@@ -250,7 +348,12 @@ JS = """
     return null;
   }
   function afficherStatut(texte) { if (statut) statut.textContent = texte; }
-  function sauverDefilement() { try { sessionStorage.setItem('iapartag-defilement', String(window.scrollY)); } catch (x) {} }
+  function sauverDefilement() {
+    try {
+      sessionStorage.setItem('iapartag-defilement', String(window.scrollY));
+      sessionStorage.setItem('iapartag-focus', (document.activeElement && document.activeElement.id) || '');
+    } catch (x) {}
+  }
   window.iapartagRecharger = function () { sauverDefilement(); location.reload(); };
   if (boutonPause) boutonPause.addEventListener('click', function () {
     pauseManuelle = !pauseManuelle;
@@ -260,7 +363,12 @@ JS = """
   document.addEventListener('submit', sauverDefilement);
   try {
     var y = sessionStorage.getItem('iapartag-defilement');
-    if (y !== null) { window.scrollTo(0, +y); sessionStorage.removeItem('iapartag-defilement'); }
+    if (y !== null) {
+      window.scrollTo(0, +y); sessionStorage.removeItem('iapartag-defilement');
+      var f = sessionStorage.getItem('iapartag-focus'); sessionStorage.removeItem('iapartag-focus');
+      var el = f ? document.getElementById(f) : null;
+      if (el && el.focus) el.focus({preventScroll: true});
+    }
   } catch (x) {}
   document.querySelectorAll('input.note').forEach(function (n) {
     var c = document.getElementById('compteur-' + n.dataset.id);
@@ -270,13 +378,17 @@ JS = """
     var raison = enPause();
     if (raison) return afficherStatut(raison + ' — la saisie est conservée.');
     if (!base) return;
-    fetch('/ui/etat', {cache: 'no-store', credentials: 'same-origin'}).then(function (r) {
+    fetch('/ui/etat?depuis=' + base.m, {cache: 'no-store', credentials: 'same-origin'}).then(function (r) {
       if (r.status === 401) throw new Error('auth');
       if (!r.ok) throw new Error('http');
       return r.json();
     }).then(function (d) {
       if (heure) heure.textContent = new Date().toLocaleTimeString();
-      var nouveau = d.messages > base.m || d.evenements > base.e || d.derniere_demande > base.d || d.en_attente > base.n;
+      var nouveau = d.nouveaux_messages > 0 || d.derniere_demande > base.d || d.en_attente > base.n;
+      var txt = [];
+      if (d.nouveaux_messages > 0) txt.push(d.nouveaux_messages + (d.nouveaux_messages > 1 ? ' nouveaux messages' : ' nouveau message'));
+      if (d.en_attente > base.n) txt.push('demande(s) de validation à examiner');
+      if (banniereTexte) banniereTexte.textContent = txt.length ? txt.join(' · ') : 'Nouveautés disponibles.';
       if (banniere) banniere.classList.toggle('on', nouveau);
       afficherStatut(nouveau ? 'Nouveautés disponibles' : 'Actualisation automatique');
     }).catch(function (err) {
@@ -323,25 +435,25 @@ async def ui(req: Request):
     if not role:
         return Response("Authentification requise", status_code=401, headers={"WWW-Authenticate": 'Basic realm="IA-partag"'})
     ags, msgs, evs, unread = state(); e = html.escape
+    q = dict(req.query_params)
     with db() as c:
         cmax = c.execute("SELECT COALESCE(MAX(id),0) m FROM messages").fetchone()["m"]
         emax = c.execute("SELECT COALESCE(MAX(id),0) m FROM events").fetchone()["m"]
         ap = c.execute("SELECT COUNT(*) n, COALESCE(MAX(id),0) m FROM approvals WHERE status='en attente'").fetchone()
-    rows = "".join(f"<tr><td>{e(m['created'])}</td><td>{e(m['sender'])}→{e(m['recipient'])}</td><td>{e(m['thread'])}</td><td>{'Récupérée' if m['delivered'] else 'À récupérer'}</td><td>{e(m['priority'])}</td><td>{e(m['body'][:200])}</td></tr>" for m in msgs)
-    erows = "".join(f"<tr><td>{e(x['ts'])}</td><td>{e(x['kind'])}</td><td>{e(x['detail'])}</td></tr>" for x in evs) or "<tr><td colspan=3>aucune</td></tr>"
-    cards = "".join(
-        f"<div class='carte {a}'><span class='badge {a}'>{a}</span> <b>Claude {a}</b><br>"
-        f"{'🟢 connecté' if v['connecte'] else '🔴 hors ligne'}<br><small>vu : {e(v['vu'] or 'jamais')}<br>à récupérer : {unread.get(a, 0)}</small></div>"
-        for a, v in ags.items())
+    rows = "".join(f"<tr><td>{e(m['created'])}</td><td>{e(m['sender'])}→{e(m['recipient'])}</td><td><a href='{e(url_with(q, fil=m['thread']))}'>{e(m['thread'])}</a></td><td>{'Récupérée' if m['delivered'] else 'À récupérer'}</td><td>{e(m['priority'])}</td><td>{e(m['body'][:200])}</td></tr>" for m in msgs)
     entete = (f"<header class=top><div><h2>IA-partag — suivi</h2><span class=meta>Connecté : <b>{e(_libelle_role(role))}</b></span></div>"
               f"<div class=meta>Dernière actualisation : <span id=heure-maj>{now()[11:]}</span> · <span id=statut-maj>Actualisation automatique</span><br>"
               "<button id=bouton-pause class='bouton b-gris' type=button aria-pressed=false>Pause</button></div></header>"
               f"<div id=etat data-messages={cmax} data-evenements={emax} data-enattente={ap['n']} data-derniere={ap['m']}></div>"
-              "<div id=banniere class=banniere role=status>Nouveautés disponibles. <button class='bouton b-bleu' type=button onclick='iapartagRecharger()'>Afficher</button></div>")
+              "<div id=banniere class=banniere role=status><span id=banniere-texte>Nouveautés disponibles.</span> "
+              "<button class='bouton b-bleu' type=button onclick='iapartagRecharger()'>Afficher</button></div>")
+    fil = q.get("fil", "")[:100]
+    corps_fils = fil_detail(q, fil) if fil else fils_block(q)
     appr = approvals_block(role) + memory_block() + ((pairing_block() + invite_block()) if role == "owner" else "")
-    body = (f"{entete}{res_banner(req.query_params)}<div class=cards>{cards}</div>{appr}"
+    body = (f"{entete}{res_banner(req.query_params)}<div class=cards>{cartes_block(ags, unread)}</div>{appr}"
+            f"<div id=fils>{corps_fils}</div>"
             f"<h3>Messages (30 derniers)</h3><div class=table-wrap><table><tr><th>date<th>sens<th>fil<th>état<th>prio<th>texte</tr>{rows}</table></div>"
-            f"<h3>Erreurs / garde-fous</h3><div class=table-wrap><table>{erows}</table></div><small>Affichage : {now()}</small>")
+            f"{journal_block(q)}<small>Affichage : {now()}</small>")
     return HTMLResponse(_page(body))
 
 def blocked_page(exc):
@@ -644,7 +756,10 @@ def backup_loop():
     import time
     while True:
         try: backup_now()
-        except Exception as ex: logging.error("sauvegarde échouée : %s", ex)
+        except Exception as ex:
+            logging.error("sauvegarde échouée : %s", ex)
+            try: event("sauvegarde-échec", f"la copie automatique a échoué : {str(ex)[:200]}")
+            except Exception: pass
         time.sleep(BACKUP_EVERY_H * 3600)
 
 async def backup_latest(req: Request):
