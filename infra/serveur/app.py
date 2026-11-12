@@ -261,7 +261,7 @@ def filtres_bar(q):
              if actifs else "")
     return f"<p class=filtres>{actif_txt}{' · '.join(liens)}{reset}</p>"
 
-def fils_block(q):
+def fils_block(q, detail=""):
     e = html.escape
     cond, args = _cond_filtre(q)
     n = _nombre(q, "nfils", 20)
@@ -279,6 +279,9 @@ def fils_block(q):
             rows += (f"<tr class='{'sel' if sel else ''}'><td><a href='{e(url_with(q, fil=t['thread']))}' data-remplace='zone-fils'{' aria-current=true' if sel else ''}>{e(t['thread'])}</a></td>"
                      f"<td>{e(_sens(t['paires']))}</td><td>{t['n']}/{MAX_PER_THREAD}{bloque}</td>"
                      f"<td><small>{e(dern['created'])} · {e(dern['sender'])}</small><br>{e(apercu)}</td></tr>")
+            if sel and detail: rows += f"<tr id=ligne-detail><td colspan=4>{detail}</td></tr>"
+    if detail and "id=ligne-detail" not in rows:   # fil hors de la liste affichée : détail en bas de liste
+        rows += f"<tr id=ligne-detail><td colspan=4>{detail}</td></tr>"
     voir = (f"<p><a href='{e(url_with(q, nfils=n + 20))}' data-remplace='zone-fils'>Voir plus de fils</a></p>" if plus else "")
     return ("<h3>Fils de discussion</h3><div class=table-wrap><table><tr><th>fil<th>sens<th>messages<th>dernier message</tr>"
             + (rows or "<tr><td colspan=4>aucun fil pour ce filtre</td></tr>") + "</table></div>" + voir)
@@ -388,8 +391,10 @@ th{color:var(--muted);font-weight:600}
 tr.sel td{background:#1d2a3a}
 small,.petit{color:var(--muted)}
 .fils-grille{display:grid;grid-template-columns:1fr;gap:12px;align-items:start}
+#liste-fils .table-wrap{max-height:60vh;overflow:auto;margin-top:0}
+#liste-fils td,#liste-fils th{padding:3px 6px}
 .fils-grille>div{min-width:0}
-@media (min-width:1000px){.fils-grille{grid-template-columns:minmax(340px,1fr) minmax(0,2fr)}}
+@media (min-width:1000px){.fils-grille{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}}
 #ligne-detail>td{padding:8px 0;border-bottom:0}
 .valeur{white-space:pre-wrap;word-break:break-word;max-height:220px;overflow:auto;background:#0d0d0d;border:1px solid #333;border-radius:6px;padding:6px;margin:0;font:13px ui-monospace,monospace}
 .diff-plus{color:#7ee787} .diff-moins{color:#ff9b9b}
@@ -457,30 +462,11 @@ JS = """
   if (!depart || !document.querySelector('button[data-onglet="' + depart + '"]')) depart = 'fils';
   activerOnglet(depart);
 
-  // Remplacement d'une zone sans recharger la page : la position de défilement est conservée
-  function placerDetail() {
-    var d = document.getElementById('fil-detail'), zone = document.getElementById('zone-detail');
-    if (!d || !zone) return;
-    var ligne = document.getElementById('ligne-detail');
-    var sel = document.querySelector('tr.sel');
-    if (window.matchMedia('(max-width: 999px)').matches && sel) {
-      if (!ligne) {
-        ligne = document.createElement('tr'); ligne.id = 'ligne-detail';
-        var td = document.createElement('td'); td.colSpan = 4; ligne.appendChild(td);
-      }
-      sel.parentNode.insertBefore(ligne, sel.nextSibling);
-      ligne.firstChild.appendChild(d);
-    } else {
-      zone.appendChild(d);
-      if (ligne && ligne.parentNode) ligne.parentNode.removeChild(ligne);
-    }
-  }
   function appliquer(doc, zones) {
     zones.forEach(function (id) {
       var neuf = doc.getElementById(id), vieux = document.getElementById(id);
       if (neuf && vieux) vieux.innerHTML = neuf.innerHTML;
     });
-    placerDetail();
   }
   function chargerZone(url, zones, focusId, lienHref) {
     fetch(url, {cache: 'no-store', credentials: 'same-origin'}).then(function (r) {
@@ -537,9 +523,6 @@ JS = """
       navigator.clipboard.writeText(texte).then(fait, function () { repli(texte); fait(); });
     } else { repli(texte); fait(); }
   }
-  var tRedim = null;
-  window.addEventListener('resize', function () { clearTimeout(tRedim); tRedim = setTimeout(placerDetail, 150); });
-  placerDetail();
 
   // Actualisation légère, pause pendant la saisie
   function saisie() {
@@ -660,8 +643,8 @@ async def ui(req: Request):
     # Permanent : cartes et « À traiter » restent visibles quel que soit l'onglet
     permanent = (f"{res_banner(q)}<div id=zone-cartes class=cards>{cartes_block(ags, unread)}</div>"
                  f"<div id=zone-traiter>{traiter_block(role)}</div>")
-    zone_fils = (f"<div id=zone-fils>{filtres_bar(q)}<div class=fils-grille><div id=liste-fils>{fils_block(q)}</div>"
-                 f"<div id=zone-detail><div id=fil-detail>{fil_detail(q, fil)}</div></div></div>{messages_table(q)}</div>")
+    zone_fils = (f"<div id=zone-fils>{filtres_bar(q)}<div class=fils-grille><div id=liste-fils>{fils_block(q, fil_detail(q, fil) if fil else '')}</div>"
+                 f"<div id=zone-messages>{messages_table(q)}</div></div></div>")
     zone_memoire = f"<div id=zone-memoire>{memory_block(q)}</div>"
     zone_journal = f"<div id=zone-journal>{historique_block()}{journal_block(q)}</div>"
     onglets = ("<nav class=onglets role=tablist aria-label='Sections'>"

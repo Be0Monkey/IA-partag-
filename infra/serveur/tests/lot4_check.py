@@ -70,6 +70,13 @@ check("messages : nmsg=30 supprime le lien", "Voir plus de messages" not in c.ge
 # Journal : liens remplaçables
 check("journal : filtres remplaçables", "data-remplace='zone-journal'" in c.get("/ui?journal=incidents", headers=OWN).text)
 
+# Détail du fil sous la ligne sélectionnée (liste à gauche), messages récents à droite
+pg = c.get("/ui?fil=g-00", headers=OWN).text
+i_sel = pg.find("aria-current=true")
+i_det = pg.find('id=ligne-detail')
+check("détail inline : juste après la ligne du fil sélectionné", 0 < i_sel < i_det and pg.index("</tr>", i_sel) < i_det and pg.count("id=ligne-detail") == 1)
+check("messages récents présents dans la colonne de droite", "id=zone-messages" in pg and "Messages récents" in pg)
+
 # Décision sans jeton : aucune notification
 n = mod.db().execute("SELECT COUNT(*) n FROM messages WHERE thread=?", (f"validation-{ap}",)).fetchone()["n"]
 check("décision sans jeton : aucune notification", n == 0, n)
