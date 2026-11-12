@@ -1,6 +1,7 @@
 import re
 """Serveur central IA-partag (phase 0) : messages, présence, auth par jeton, interface de suivi minimale."""
-import base64, datetime, hashlib, hmac, html, json, logging, pathlib, secrets, sqlite3, sys
+import base64, datetime, hashlib, hmac, html, json, logging, math, pathlib, secrets, sqlite3, sys
+from urllib.parse import parse_qs
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -53,24 +54,52 @@ def agent_of(req):
 def pw_hash(pw, salt):
     return hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, 200_000).hex()
 
-HUM_MAX_FAILS = 5   # echecs max d'identifiants sur /ui par fenetre de 10 min, tous clients confondus
+def form_data(req):
+    """Lit un formulaire urlencoded sans dépendance externe (pas besoin de python-multipart)."""
+    async def _read():
+        raw = (await req.body()).decode("utf-8", "replace")
+        return {k: v[0] for k, v in parse_qs(raw, keep_blank_values=True).items()}
+    return _read()
+
+HUM_MAX_FAILS = 5       # échecs d'identifiants max par client (adresse + nom saisi) sur la fenêtre
+HUM_WINDOW_MIN = 10     # fenêtre de comptage et durée du blocage, en minutes
+
+class HumanBlocked(Exception):
+    """Client bloqué après trop d'échecs d'identifiants (limite par client, pas globale)."""
+    def __init__(self, minutes, user):
+        self.minutes, self.user = minutes, user
+
+def _basic(h):
+    try:
+        user, pw = base64.b64decode(h[6:]).decode("utf-8").split(":", 1)
+        return user, pw
+    except Exception:
+        return None, None
 
 def human_role(req):
-    """Verifie les identifiants humains, avec blocage apres trop d'echecs."""
+    """Vérifie les identifiants humains. Lève HumanBlocked si ce client a échoué trop souvent."""
     h = req.headers.get("authorization", "")
     if not h.startswith("Basic "): return None
-    lim = (datetime.datetime.now() - datetime.timedelta(minutes=10)).isoformat(timespec="seconds")
+    user, _ = _basic(h)
+    ip = req.client.host if req.client else "?"
+    key = f"{ip}|{user or '?'}"
+    lim = (datetime.datetime.now() - datetime.timedelta(minutes=HUM_WINDOW_MIN)).isoformat(timespec="seconds")
     with db() as c:
-        if c.execute("SELECT COUNT(*) n FROM events WHERE kind='humain-\u00e9chec' AND ts>=?", (lim,)).fetchone()["n"] >= HUM_MAX_FAILS:
-            return None
+        rows = c.execute("SELECT ts, detail FROM events WHERE kind='humain-échec' AND ts>=? ORDER BY ts", (lim,)).fetchall()
+    mine = [r["ts"] for r in rows if r["detail"].startswith(f"client={key};")]
+    if len(mine) >= HUM_MAX_FAILS:
+        # le blocage se lève quand il ne reste plus assez d'échecs dans la fenêtre
+        fin = datetime.datetime.fromisoformat(mine[-HUM_MAX_FAILS]) + datetime.timedelta(minutes=HUM_WINDOW_MIN)
+        minutes = max(1, math.ceil((fin - datetime.datetime.now()).total_seconds() / 60))
+        raise HumanBlocked(minutes, user or "?")
     r = _human_role_check(h)
-    if r is None: event("humain-\u00e9chec", "identifiants invalides sur le tableau de bord")
+    if r is None: event("humain-échec", f"client={key}; identifiants invalides")
     return r
 
 def _human_role_check(h):
     """'owner' (identifiant humain), 'humain-A' (humain du PC 2) ou None."""
-    try: user, pw = base64.b64decode(h[6:]).decode("utf-8").split(":", 1)
-    except Exception: return None
+    user, pw = _basic(h)
+    if user is None: return None
     if user == "humain" and hmac.compare_digest(pw, TOKENS["admin"]): return "owner"
     if user == "humain-A":
         with db() as c: r = c.execute("SELECT * FROM humans WHERE name='humain-A'").fetchone()
@@ -147,22 +176,180 @@ async def status(req: Request):
     ags, _, _, unread = state()
     return JSONResponse({"agents": ags, "non_lus": unread})
 
+async def ui_state(req: Request):
+    """Résumé léger pour l'actualisation de /ui : sert à détecter les nouveautés sans recharger la page."""
+    role = human_role(req)
+    if not role: return JSONResponse({"erreur": "non autorisé"}, status_code=401)
+    with db() as c:
+        expire(c)
+        m = c.execute("SELECT COALESCE(MAX(id),0) m FROM messages").fetchone()["m"]
+        e = c.execute("SELECT COALESCE(MAX(id),0) m FROM events").fetchone()["m"]
+        ap = c.execute("SELECT COUNT(*) n, COALESCE(MAX(id),0) m FROM approvals WHERE status='en attente'").fetchone()
+    return JSONResponse({"messages": m, "evenements": e, "en_attente": ap["n"], "derniere_demande": ap["m"]})
+
+CSS = """
+:root{--bg:#111;--fg:#eee;--line:#333;--card:#1b1b1b;--muted:#9aa0a6;--A:#7DD3FC;--B:#C4B5FD;--ok:#1a7f37;--ko:#b62324;--btn:#1f6feb}
+*{box-sizing:border-box}
+body{font:14px system-ui,sans-serif;margin:0;padding:16px;background:var(--bg);color:var(--fg)}
+a{color:#8ab4ff}
+h2{margin:0 0 4px;font-size:20px} h3{margin:22px 0 8px;font-size:16px}
+header.top{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);padding-bottom:10px}
+header.top .meta{color:var(--muted);font-size:13px}
+.cards{display:flex;flex-wrap:wrap;gap:12px;margin:14px 0}
+.carte{flex:1 1 280px;min-width:0;border:2px solid var(--line);border-radius:10px;padding:12px;background:var(--card)}
+.carte.A{border-color:var(--A)} .carte.B{border-color:var(--B)}
+.badge{display:inline-block;min-width:26px;text-align:center;border-radius:13px;padding:2px 8px;font-weight:700;color:#111}
+.badge.A{background:var(--A)} .badge.B{background:var(--B)}
+.bloc{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;margin:10px 0}
+.urgent{border-color:#b62324}
+.etiq{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;background:#444}
+.etiq.critique{background:var(--ko)}
+.bouton{border:0;padding:7px 14px;border-radius:6px;color:#fff;cursor:pointer;font:inherit}
+.b-ok{background:var(--ok)} .b-ko{background:var(--ko)} .b-bleu{background:var(--btn)} .b-gris{background:#444}
+button:focus-visible,a:focus-visible,input:focus-visible,textarea:focus-visible,summary:focus-visible{outline:3px solid #ffd54f;outline-offset:2px}
+input.note{width:100%;max-width:340px;padding:6px;background:#0d0d0d;color:var(--fg);border:1px solid #555;border-radius:6px}
+.compteur{font-size:12px;color:var(--muted)}
+.banniere{position:sticky;top:0;z-index:5;background:#263238;border:1px solid #4f6d7a;border-radius:8px;padding:8px 12px;margin:8px 0;display:none}
+.banniere.on{display:block}
+.resultat{background:#1e2d1e;border:1px solid var(--ok);border-radius:8px;padding:10px;margin:10px 0}
+.resultat.ko{background:#2d1e1e;border-color:var(--ko)}
+.table-wrap{overflow-x:auto;margin:8px 0 20px}
+table{border-collapse:collapse;width:100%}
+td,th{border-bottom:1px solid #333;padding:4px 8px;text-align:left;vertical-align:top;word-break:break-word}
+th{color:var(--muted);font-weight:600}
+small,.petit{color:var(--muted)}
+details{margin:6px 0}
+summary{cursor:pointer;font-weight:600}
+@media (max-width:640px){body{padding:12px 16px}.carte{flex-basis:100%}}
+"""
+
+JS = """
+(function(){
+  var st = document.getElementById('etat');
+  var boutonPause = document.getElementById('bouton-pause');
+  var statut = document.getElementById('statut-maj');
+  var heure = document.getElementById('heure-maj');
+  var banniere = document.getElementById('banniere');
+  var base = st ? {m: +st.dataset.messages, e: +st.dataset.evenements, n: +st.dataset.enattente, d: +st.dataset.derniere} : null;
+  var pauseManuelle = false;
+  try { pauseManuelle = sessionStorage.getItem('iapartag-pause') === '1'; } catch (x) {}
+  function saisie() {
+    var el = document.activeElement;
+    if (el && (el.tagName === 'TEXTAREA' || (el.tagName === 'INPUT' && /^(text|search|password)$/.test(el.type)))) return true;
+    var notes = document.querySelectorAll('input.note');
+    for (var i = 0; i < notes.length; i++) if (notes[i].value.trim() !== '') return true;
+    return false;
+  }
+  function majPause() {
+    if (boutonPause) boutonPause.textContent = pauseManuelle ? 'Reprendre' : 'Pause';
+    if (boutonPause) boutonPause.setAttribute('aria-pressed', pauseManuelle ? 'true' : 'false');
+  }
+  function enPause() {
+    if (pauseManuelle) return 'Actualisation en pause (manuelle)';
+    if (saisie()) return 'Actualisation en pause : saisie en cours';
+    return null;
+  }
+  function afficherStatut(texte) { if (statut) statut.textContent = texte; }
+  function sauverDefilement() { try { sessionStorage.setItem('iapartag-defilement', String(window.scrollY)); } catch (x) {} }
+  window.iapartagRecharger = function () { sauverDefilement(); location.reload(); };
+  if (boutonPause) boutonPause.addEventListener('click', function () {
+    pauseManuelle = !pauseManuelle;
+    try { sessionStorage.setItem('iapartag-pause', pauseManuelle ? '1' : '0'); } catch (x) {}
+    majPause(); if (!pauseManuelle) tick();
+  });
+  document.addEventListener('submit', sauverDefilement);
+  try {
+    var y = sessionStorage.getItem('iapartag-defilement');
+    if (y !== null) { window.scrollTo(0, +y); sessionStorage.removeItem('iapartag-defilement'); }
+  } catch (x) {}
+  document.querySelectorAll('input.note').forEach(function (n) {
+    var c = document.getElementById('compteur-' + n.dataset.id);
+    n.addEventListener('input', function () { if (c) c.textContent = n.value.length + ' / 300'; });
+  });
+  function tick() {
+    var raison = enPause();
+    if (raison) return afficherStatut(raison + ' — la saisie est conservée.');
+    if (!base) return;
+    fetch('/ui/etat', {cache: 'no-store', credentials: 'same-origin'}).then(function (r) {
+      if (r.status === 401) throw new Error('auth');
+      if (!r.ok) throw new Error('http');
+      return r.json();
+    }).then(function (d) {
+      if (heure) heure.textContent = new Date().toLocaleTimeString();
+      var nouveau = d.messages > base.m || d.evenements > base.e || d.derniere_demande > base.d || d.en_attente > base.n;
+      if (banniere) banniere.classList.toggle('on', nouveau);
+      afficherStatut(nouveau ? 'Nouveautés disponibles' : 'Actualisation automatique');
+    }).catch(function (err) {
+      afficherStatut(err.message === 'auth' ? 'Session expirée : recharge la page pour te reconnecter' : 'Serveur injoignable, nouvel essai dans 5 s');
+    });
+  }
+  majPause();
+  setInterval(tick, 5000);
+})();
+"""
+
+def _page(body, title="IA-partag"):
+    return (f"<!doctype html><html lang=fr><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+            f"<title>{title}</title><style>{CSS}</style>{body}<script>{JS}</script></html>")
+
+def _libelle_role(role):
+    return "propriétaire" if role == "owner" else "humain du PC 2 (humain-A)"
+
+def _date(s):
+    return html.escape(s or "jamais")
+
+def res_banner(q):
+    """Résultat réel d'une décision, relu en base (évite d'afficher un succès inventé)."""
+    res = q.get("res", "")
+    try: aid = int(q.get("id", ""))
+    except Exception: return ""
+    if res not in ("ok", "deja", "expiree", "introuvable", "interdit"): return ""
+    with db() as c: r = c.execute("SELECT * FROM approvals WHERE id=?", (aid,)).fetchone()
+    if res == "introuvable" or not r:
+        return f"<div class='resultat ko'>Demande #{aid} introuvable.</div>"
+    par = html.escape(r["decided_by"] or "personne")
+    if res == "ok":
+        return f"<div class=resultat>Décision enregistrée pour la demande #{aid} : <b>{html.escape(r['status'])}</b> par {par}, le {_date(r['decided'])}.</div>"
+    if res == "deja":
+        return (f"<div class='resultat ko'>La demande #{aid} était déjà traitée : <b>{html.escape(r['status'])}</b> par {par}, le {_date(r['decided'])}. "
+                "Aucune nouvelle notification n'a été envoyée à Claude.</div>")
+    if res == "expiree":
+        return (f"<div class='resultat ko'>La demande #{aid} a expiré (délai de 24 h) avant ta décision. "
+                "Aucune notification d'approbation ou de refus n'a été envoyée.</div>")
+    return f"<div class='resultat ko'>Tu ne peux pas trancher la demande #{aid} : décision réservée au propriétaire.</div>"
+
 async def ui(req: Request):
     role = human_role(req)
     if not role:
         return Response("Authentification requise", status_code=401, headers={"WWW-Authenticate": 'Basic realm="IA-partag"'})
     ags, msgs, evs, unread = state(); e = html.escape
-    rows = "".join(f"<tr><td>{e(m['created'])}</td><td>{e(m['sender'])}→{e(m['recipient'])}</td><td>{e(m['thread'])}</td><td>{'lu' if m['delivered'] else 'NON LU'}</td><td>{e(m['priority'])}</td><td>{e(m['body'][:200])}</td></tr>" for m in msgs)
+    with db() as c:
+        cmax = c.execute("SELECT COALESCE(MAX(id),0) m FROM messages").fetchone()["m"]
+        emax = c.execute("SELECT COALESCE(MAX(id),0) m FROM events").fetchone()["m"]
+        ap = c.execute("SELECT COUNT(*) n, COALESCE(MAX(id),0) m FROM approvals WHERE status='en attente'").fetchone()
+    rows = "".join(f"<tr><td>{e(m['created'])}</td><td>{e(m['sender'])}→{e(m['recipient'])}</td><td>{e(m['thread'])}</td><td>{'Récupérée' if m['delivered'] else 'À récupérer'}</td><td>{e(m['priority'])}</td><td>{e(m['body'][:200])}</td></tr>" for m in msgs)
     erows = "".join(f"<tr><td>{e(x['ts'])}</td><td>{e(x['kind'])}</td><td>{e(x['detail'])}</td></tr>" for x in evs) or "<tr><td colspan=3>aucune</td></tr>"
-    cards = "".join(f"<div class=c><b>Claude {a}</b><br>{'🟢 connecté' if v['connecte'] else '🔴 hors ligne'}<br><small>vu : {e(v['vu'] or 'jamais')}<br>non lus : {unread.get(a, 0)}</small></div>" for a, v in ags.items())
-    who = "propri?taire" if role == "owner" else "humain du PC 2 (humain-A)"
-    appr = f"<p>Connect? : <b>{who}</b></p>" + approvals_block(role) + memory_block() + ((pairing_block() + invite_block()) if role == "owner" else "")
-    page = f"""<!doctype html><meta charset=utf-8><meta http-equiv=refresh content=5><title>IA-partag</title>
-<style>body{{font:14px system-ui;margin:20px;background:#111;color:#eee}}.c{{display:inline-block;border:1px solid #444;border-radius:8px;padding:12px;margin-right:12px}}
-table{{border-collapse:collapse;width:100%;margin:8px 0 24px}}td,th{{border-bottom:1px solid #333;padding:4px 8px;text-align:left}}</style>
-<h2>IA-partag — suivi</h2>{cards}{appr}<h3>Messages (30 derniers)</h3><table><tr><th>date<th>sens<th>fil<th>état<th>prio<th>texte</tr>{rows}</table>
-<h3>Erreurs / garde-fous</h3><table>{erows}</table><small>Rafraîchi toutes les 5 s — {now()}</small>"""
-    return HTMLResponse(page)
+    cards = "".join(
+        f"<div class='carte {a}'><span class='badge {a}'>{a}</span> <b>Claude {a}</b><br>"
+        f"{'🟢 connecté' if v['connecte'] else '🔴 hors ligne'}<br><small>vu : {e(v['vu'] or 'jamais')}<br>à récupérer : {unread.get(a, 0)}</small></div>"
+        for a, v in ags.items())
+    entete = (f"<header class=top><div><h2>IA-partag — suivi</h2><span class=meta>Connecté : <b>{e(_libelle_role(role))}</b></span></div>"
+              f"<div class=meta>Dernière actualisation : <span id=heure-maj>{now()[11:]}</span> · <span id=statut-maj>Actualisation automatique</span><br>"
+              "<button id=bouton-pause class='bouton b-gris' type=button aria-pressed=false>Pause</button></div></header>"
+              f"<div id=etat data-messages={cmax} data-evenements={emax} data-enattente={ap['n']} data-derniere={ap['m']}></div>"
+              "<div id=banniere class=banniere role=status>Nouveautés disponibles. <button class='bouton b-bleu' type=button onclick='iapartagRecharger()'>Afficher</button></div>")
+    appr = approvals_block(role) + memory_block() + ((pairing_block() + invite_block()) if role == "owner" else "")
+    body = (f"{entete}{res_banner(req.query_params)}<div class=cards>{cards}</div>{appr}"
+            f"<h3>Messages (30 derniers)</h3><div class=table-wrap><table><tr><th>date<th>sens<th>fil<th>état<th>prio<th>texte</tr>{rows}</table></div>"
+            f"<h3>Erreurs / garde-fous</h3><div class=table-wrap><table>{erows}</table></div><small>Affichage : {now()}</small>")
+    return HTMLResponse(_page(body))
+
+def blocked_page(exc):
+    user = html.escape(exc.user)
+    return HTMLResponse(_page(f"<h2>Connexion bloquée</h2><div class='resultat ko'>Trop d'identifiants invalides depuis ce client (nom saisi : <b>{user}</b>). "
+                               f"Motif : {HUM_MAX_FAILS} échecs en {HUM_WINDOW_MIN} minutes. Réessaie dans <b>{exc.minutes} min</b>.<br>"
+                               "Cette limite ne concerne que ce client : l'autre utilisateur n'est pas bloqué.</div>", "Connexion bloquée"),
+                        status_code=429, headers={"Retry-After": str(exc.minutes * 60)})
 
 APPROVAL_TTL_H = 24      # une demande non traitée expire après 24 h
 MAX_PENDING = 5          # demandes en attente max par agent
@@ -203,31 +390,44 @@ async def approval_get(req: Request):
     if not r: return JSONResponse({"erreur": "demande introuvable"}, status_code=404)
     return JSONResponse({"id": r["id"], "action": r["action"], "statut": r["status"], "decidee": r["decided"], "note": r["note"]})
 
+def _peut_trancher(role, r):
+    return role == "owner" or (r["requester"] == "A" and (r["level"] or "local") == "local")
+
 async def approval_decide(req: Request):
     role = human_role(req)
     if not role: return Response("Authentification requise", status_code=401)
-    f = await req.form()
-    try: aid = int(f.get("id"))
+    f = await form_data(req)
+    try: aid = int(f.get("id", ""))
     except Exception: return Response("id invalide", status_code=400)
     if not hmac.compare_digest(str(f.get("csrf", "")), csrf(aid)): return Response("jeton de formulaire invalide", status_code=403)
     dec = {"approve": "approuvée", "deny": "refusée"}.get(f.get("decision"))
     if not dec: return Response("décision invalide", status_code=400)
     note = str(f.get("note", ""))[:300]
+    par = "le propriétaire" if role == "owner" else "l'humain du PC 2"
     with db() as c:
         expire(c)
         r = c.execute("SELECT * FROM approvals WHERE id=?", (aid,)).fetchone()
-        if r and r["status"] == "en attente":
-            if not (role == "owner" or (r["requester"] == "A" and (r["level"] or "local") == "local")):
-                event("validation-refusée", f"{role} n'a pas le droit de trancher #{aid} ({r['requester']}, {r['level']})", c)
-                return Response("Décision réservée au propriétaire", status_code=403)
-            par = "le propriétaire" if role == "owner" else "l'humain du PC 2"
-            c.execute("UPDATE approvals SET status=?, decided=?, note=?, decided_by=? WHERE id=?", (dec, now(), note, par, aid))
-            body = (f"[VALIDATION #{aid}] Décision de {par} : {dec.upper()}. Action concernée : {r['action']}." + (f" Note : {note}" if note else "")
-                    + (" Tu peux l'exécuter, uniquement cette action." if dec == "approuvée" else " Ne l'exécute pas."))
-            c.execute("INSERT INTO messages(uid,thread,sender,recipient,priority,body,created) VALUES(?,?,?,?,?,?,?)",
-                      (None, f"validation-{aid}", "H", r["requester"], "urgente", body, now()))
-            event("validation", f"#{aid} {dec} par {par} pour {r['requester']}", c)
-    return RedirectResponse("/ui", status_code=303)
+        if not r: return RedirectResponse(f"/ui?res=introuvable&id={aid}", status_code=303)
+        if not _peut_trancher(role, r):
+            event("validation-refusée", f"{role} n'a pas le droit de trancher #{aid} ({r['requester']}, {r['level']})", c)
+            return RedirectResponse(f"/ui?res=interdit&id={aid}", status_code=303)
+        # Mise à jour conditionnelle : une seule décision possible, même si deux humains valident en même temps.
+        cur = c.execute("UPDATE approvals SET status=?, decided=?, note=?, decided_by=? WHERE id=? AND status='en attente'", (dec, now(), note, par, aid))
+        if cur.rowcount != 1:
+            s = c.execute("SELECT status FROM approvals WHERE id=?", (aid,)).fetchone()["status"]
+            return RedirectResponse(f"/ui?res={'expiree' if s == 'expirée' else 'deja'}&id={aid}", status_code=303)
+        body = (f"[VALIDATION #{aid}] Décision de {par} : {dec.upper()}. Action concernée : {r['action']}." + (f" Note : {note}" if note else "")
+                + (" Tu peux l'exécuter, uniquement cette action." if dec == "approuvée" else " Ne l'exécute pas."))
+        c.execute("INSERT INTO messages(uid,thread,sender,recipient,priority,body,created) VALUES(?,?,?,?,?,?,?)",
+                  (None, f"validation-{aid}", "H", r["requester"], "urgente", body, now()))
+        event("validation", f"#{aid} {dec} par {par} pour {r['requester']}", c)
+    return RedirectResponse(f"/ui?res=ok&id={aid}", status_code=303)
+
+def _echeance(created):
+    fin = datetime.datetime.fromisoformat(created) + datetime.timedelta(hours=APPROVAL_TTL_H)
+    reste = int((fin - datetime.datetime.now()).total_seconds() // 60)
+    if reste <= 0: return f"échéance {fin:%d/%m %H:%M} (dépassée)"
+    return f"échéance {fin:%d/%m %H:%M} (reste {reste // 60} h {reste % 60:02d})"
 
 def approvals_block(role="owner"):
     e = html.escape
@@ -235,25 +435,31 @@ def approvals_block(role="owner"):
         expire(c)
         pend = c.execute("SELECT * FROM approvals WHERE status='en attente' ORDER BY id").fetchall()
         hist = c.execute("SELECT * FROM approvals WHERE status!='en attente' ORDER BY id DESC LIMIT 15").fetchall()
-    if role != "owner":
-        pend = [a for a in pend if a["requester"] == "A"]; hist = [a for a in hist if a["requester"] == "A"]
-    out = "<h3>Demandes de validation en attente</h3>"
+    # Bloc « À traiter » : ce que le rôle connecté peut trancher, les plus proches de l'échéance d'abord
+    a_traiter = [a for a in pend if _peut_trancher(role, a)]
+    out = "<div class='bloc urgent' id=a-traiter><h3 style='margin-top:0'>À traiter</h3>"
+    if not a_traiter: out += "<p>Aucune décision attendue de toi.</p>"
+    out += "".join(f"<p>#{a['id']} — Claude {e(a['requester'])} : {e(a['action'])} <small>({_echeance(a['created'])})</small></p>" for a in a_traiter)
+    out += "</div><h3>Demandes de validation en attente</h3>"
     if not pend: out += "<p>Aucune demande en attente.</p>"
     for a in pend:
         lvl = a["level"] or "local"
-        can = role == "owner" or (a["requester"] == "A" and lvl == "local")
-        tag = "<span style='background:#b62324;padding:2px 8px;border-radius:10px'>CRITIQUE</span>" if lvl == "critique" else "<span style='background:#444;padding:2px 8px;border-radius:10px'>local</span>"
-        out += (f"<div class=c style='display:block;margin:8px 0'><b>#{a['id']} — Claude {e(a['requester'])}</b> {tag} ({e(a['created'])})<br>"
+        can = _peut_trancher(role, a)
+        tag = "<span class='etiq critique'>CRITIQUE</span>" if lvl == "critique" else "<span class=etiq>local</span>"
+        out += (f"<div class='bloc' style='margin:8px 0'><b>#{a['id']} — Claude {e(a['requester'])}</b> {tag} <small>({e(a['created'])}, {_echeance(a['created'])})</small><br>"
                 f"<b>Action :</b> {e(a['action'])}<br><small>{e(a['details'])}</small>")
         if can:
             out += (f"<form method=post action='/ui/decision' style='margin-top:8px'><input type=hidden name=id value={a['id']}>"
-                    f"<input type=hidden name=csrf value={csrf(a['id'])}><input name=note placeholder='note (facultatif)' style='width:260px'> "
-                    f"<button name=decision value=approve style='background:#1a7f37;color:#fff;border:0;padding:6px 14px;border-radius:6px'>Approuver</button> "
-                    f"<button name=decision value=deny style='background:#b62324;color:#fff;border:0;padding:6px 14px;border-radius:6px'>Refuser</button></form></div>")
+                    f"<input type=hidden name=csrf value={csrf(a['id'])}>"
+                    f"<label for=note-{a['id']}>Note (facultative)</label> <input class=note id=note-{a['id']} data-id={a['id']} name=note maxlength=300 placeholder='note (facultatif)'> "
+                    f"<span class=compteur id=compteur-{a['id']}>0 / 300</span><br>"
+                    f"<button class='bouton b-ok' name=decision value=approve>Approuver</button> "
+                    f"<button class='bouton b-ko' name=decision value=deny>Refuser</button></form></div>")
         else:
-            out += "<p><i>Décision réservée au propriétaire (action critique).</i></p></div>"
-    rows = "".join(f"<tr><td>#{a['id']}</td><td>{e(a['requester'])}</td><td>{e(a['level'] or 'local')}</td><td>{e(a['action'])}</td><td>{e(a['status'])}</td><td>{e(a['decided_by'] or '')}</td><td>{e(a['decided'] or '')}</td><td>{e(a['note'] or '')}</td></tr>" for a in hist)
-    out += "<h3>Historique des validations</h3><table><tr><th>n°<th>de<th>niveau<th>action<th>décision<th>par<th>date<th>note</tr>" + (rows or "<tr><td colspan=8>aucune</td></tr>") + "</table>"
+            out += "<p><i>Décision réservée au propriétaire.</i></p></div>"
+    rows = "".join(f"<tr><td>#{a['id']}</td><td>{e(a['requester'])}</td><td>{e(a['level'] or 'local')}</td><td>{e(a['action'])}</td><td>{e(a['status'])}</td><td>{e(a['decided_by'] or 'non renseigné')}</td><td>{e(a['decided'] or '')}</td><td>{e(a['note'] or '')}</td></tr>" for a in hist)
+    out += ("<h3>Historique des validations</h3><div class=table-wrap><table><tr><th>n°<th>de<th>niveau<th>action<th>décision<th>décidée par<th>date<th>note</tr>"
+            + (rows or "<tr><td colspan=8>aucune</td></tr>") + "</table></div>")
     return out
 
 PAIR_TTL_MIN = 10          # validité d'un code d'appairage
@@ -265,7 +471,7 @@ def hash_code(code):
 
 async def pair_create(req: Request):
     if not is_admin(req): return Response("Authentification requise", status_code=401)
-    f = await req.form(); agent = f.get("agent")
+    f = await form_data(req); agent = f.get("agent")
     if agent not in AGENTS: return Response("agent invalide", status_code=400)
     if not hmac.compare_digest(str(f.get("csrf", "")), csrf("pair-" + agent)): return Response("jeton de formulaire invalide", status_code=403)
     code = "".join(secrets.choice(ALPHABET) for _ in range(10))
@@ -301,7 +507,7 @@ async def pair(req: Request):
 
 def pairing_block():
     forms = "".join(f"<form method=post action='/ui/pair-create' style='display:inline-block;margin-right:10px'><input type=hidden name=agent value={a}><input type=hidden name=csrf value={csrf('pair-' + a)}>"
-                    f"<button style='background:#1f6feb;color:#fff;border:0;padding:8px 16px;border-radius:6px'>Générer un code pour le Claude {a}</button></form>" for a in AGENTS)
+                    f"<button class='bouton b-bleu'>Générer un code pour le Claude {a}</button></form>" for a in AGENTS)
     return f"<h3>Appairer un PC (sans clé USB)</h3><p><small>Code à usage unique, valable {PAIR_TTL_MIN} min. À donner au Claude de l'autre PC.</small></p>{forms}"
 
 INVITE_TTL_MIN = 10
@@ -317,11 +523,11 @@ def migrate():
 def invite_block():
     return (f"<h3>Inviter l'humain du PC 2</h3><p><small>Génère un code (valable {INVITE_TTL_MIN} min, usage unique). La personne ouvre http://{CFG['host']}:{CFG['port']}/invite sur son PC et choisit elle-même son mot de passe : tu ne le connaîtras pas.</small></p>"
             f"<form method=post action='/ui/invite-create'><input type=hidden name=csrf value={csrf('invite')}>"
-            "<button style='background:#8957e5;color:#fff;border:0;padding:8px 16px;border-radius:6px'>Générer un code d'invitation</button></form>")
+            "<button class='bouton' style='background:#8957e5'>Générer un code d'invitation</button></form>")
 
 async def invite_create(req: Request):
     if not is_admin(req): return Response("Réservé au propriétaire", status_code=401)
-    f = await req.form()
+    f = await form_data(req)
     if not hmac.compare_digest(str(f.get("csrf", "")), csrf("invite")): return Response("jeton de formulaire invalide", status_code=403)
     code = "".join(secrets.choice(ALPHABET) for _ in range(10))
     exp = (datetime.datetime.now() + datetime.timedelta(minutes=INVITE_TTL_MIN)).isoformat(timespec="seconds")
@@ -344,7 +550,7 @@ def invite_form(msg=""):
 
 async def invite(req: Request):
     if req.method == "GET": return invite_form()
-    f = await req.form(); pw, pw2 = str(f.get("pw", "")), str(f.get("pw2", ""))
+    f = await form_data(req); pw, pw2 = str(f.get("pw", "")), str(f.get("pw2", ""))
     lim = (datetime.datetime.now() - datetime.timedelta(minutes=10)).isoformat(timespec="seconds")
     with db() as c:
         if c.execute("SELECT COUNT(*) n FROM events WHERE kind='invitation-échec' AND ts>=?", (lim,)).fetchone()["n"] >= PAIR_MAX_FAILS:
@@ -423,7 +629,7 @@ def memory_block():
     e = html.escape
     with db() as c: rows = c.execute("SELECT key,version,author,updated,substr(value,1,120) v FROM memory ORDER BY updated DESC LIMIT 20").fetchall()
     body = "".join(f"<tr><td>{e(r['key'])}</td><td>v{r['version']}</td><td>{e(r['author'])}</td><td>{e(r['updated'])}</td><td>{e(r['v'])}</td></tr>" for r in rows)
-    return "<h3>Mémoire partagée (lecture seule)</h3><table><tr><th>clé<th>version<th>auteur<th>maj<th>début de la valeur</tr>" + (body or "<tr><td colspan=5>vide</td></tr>") + "</table>"
+    return "<h3>Mémoire partagée (lecture seule)</h3><div class=table-wrap><table><tr><th>clé<th>version<th>auteur<th>maj<th>début de la valeur</tr>" + (body or "<tr><td colspan=5>vide</td></tr>") + "</table></div>"
 
 def backup_now(tag="auto"):
     BACKUP_DIR.mkdir(exist_ok=True)
@@ -443,11 +649,11 @@ def backup_loop():
 
 async def backup_latest(req: Request):
     """Derniere sauvegarde de la base, reservee a l'agent A (PC 2) : copie hors du PC 1."""
-    if agent_of(req) != "A": return JSONResponse({"erreur": "non autoris\u00e9"}, status_code=401)
+    if agent_of(req) != "A": return JSONResponse({"erreur": "non autorisé"}, status_code=401)
     files = sorted(BACKUP_DIR.glob("bus-*.db"))
     if not files: return JSONResponse({"erreur": "aucune sauvegarde"}, status_code=404)
     f = files[-1]
-    with db() as c: event("sauvegarde", f"copie {f.name} envoy\u00e9e au PC 2", c)
+    with db() as c: event("sauvegarde", f"copie {f.name} envoyée au PC 2", c)
     return Response(f.read_bytes(), media_type="application/octet-stream", headers={"X-Backup-Name": f.name})
 
 init()
@@ -455,7 +661,8 @@ migrate()
 mem_init()
 threading.Thread(target=backup_loop, daemon=True).start()
 app = Starlette(routes=[Route("/send", send, methods=["POST"]), Route("/inbox", inbox), Route("/heartbeat", heartbeat, methods=["POST"]),
-                        Route("/status", status), Route("/backup/latest", backup_latest), Route("/approval", approval_new, methods=["POST"]), Route("/memory", memory_get), Route("/memory/put", memory_put, methods=["POST"]), Route("/approval/{aid:int}", approval_get), Route("/ui/decision", approval_decide, methods=["POST"]), Route("/ui/pair-create", pair_create, methods=["POST"]), Route("/ui/invite-create", invite_create, methods=["POST"]), Route("/invite", invite, methods=["GET", "POST"]), Route("/pair", pair, methods=["POST"]), Route("/ui", ui), Route("/", ui)])
+                        Route("/status", status), Route("/backup/latest", backup_latest), Route("/approval", approval_new, methods=["POST"]), Route("/memory", memory_get), Route("/memory/put", memory_put, methods=["POST"]), Route("/approval/{aid:int}", approval_get), Route("/ui/decision", approval_decide, methods=["POST"]), Route("/ui/pair-create", pair_create, methods=["POST"]), Route("/ui/invite-create", invite_create, methods=["POST"]), Route("/ui/etat", ui_state), Route("/invite", invite, methods=["GET", "POST"]), Route("/pair", pair, methods=["POST"]), Route("/ui", ui), Route("/", ui)],
+                exception_handlers={HumanBlocked: lambda req, exc: blocked_page(exc)})
 
 if __name__ == "__main__":
     import uvicorn
