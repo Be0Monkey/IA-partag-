@@ -1,6 +1,6 @@
 import re
 """Serveur central IA-partag (phase 0) : messages, présence, auth par jeton, interface de suivi minimale."""
-import base64, datetime, hashlib, hmac, html, json, logging, math, pathlib, secrets, sqlite3, sys
+import base64, datetime, difflib, hashlib, hmac, html, json, logging, math, pathlib, secrets, sqlite3, sys
 from urllib.parse import parse_qs, quote, urlencode
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -226,33 +226,75 @@ def _sens(paires):
     if "A>B" in ps and "B>A" in ps: return "A ↔ B"
     return ", ".join(sorted(p.replace(">", " → ") for p in ps))
 
+def _garde_msg(m, q):
+    """Filtres de la liste de messages : urgents, à récupérer, expéditeur A ou B."""
+    f, s = q.get("filtre"), q.get("sens")
+    if f == "urgents" and m["priority"] != "urgente": return False
+    if f == "recuperer" and m["delivered"]: return False
+    if s in ("A", "B") and m["sender"] != s: return False
+    return True
+
+def _cond_filtre(q):
+    conds, args = [], []
+    f, s = q.get("filtre"), q.get("sens")
+    if f == "urgents": conds.append("priority='urgente'")
+    if f == "recuperer": conds.append("delivered IS NULL")
+    if s in ("A", "B"): conds.append("sender=?"); args.append(s)
+    return (" AND ".join(conds) or "1=1"), args
+
+def filtres_bar(q):
+    e = html.escape
+    f, s = q.get("filtre", ""), q.get("sens", "")
+    def lien(libelle, actif, nouveaux):
+        etat = {k: v for k, v in {"filtre": nouveaux.get("filtre", f), "sens": nouveaux.get("sens", s)}.items() if v}
+        cls = " class=actif aria-current=true" if actif else ""
+        return f"<a href='{e(url_with(q, **nouveaux))}' data-filtre='{e(urlencode(etat))}'{cls}>{libelle}</a>"
+    liens = [lien("Tous", not f and not s, {"filtre": None}),
+             lien("Urgents", f == "urgents", {"filtre": "urgents"}),
+             lien("À récupérer", f == "recuperer", {"filtre": "recuperer"}),
+             lien("Envoyés par A", s == "A", {"sens": "A"}),
+             lien("Envoyés par B", s == "B", {"sens": "B"})]
+    actifs = [x for x in (f, s) if x]
+    actif_txt = f"<b>Filtre actif : {e(' + '.join(actifs))}</b> · " if actifs else ""
+    reset = f" · <a href='{e(url_with(q, filtre=None, sens=None, journal=None))}' data-filtre=''>Réinitialiser</a>" if actifs else ""
+    return f"<p class=filtres>{actif_txt}{' · '.join(liens)}{reset}</p>"
+
 def fils_block(q):
     e = html.escape
+    cond, args = _cond_filtre(q)
     with db() as c:
         lst = c.execute("SELECT thread, COUNT(*) n, MAX(id) mid, GROUP_CONCAT(DISTINCT sender || '>' || recipient) paires "
-                        "FROM messages GROUP BY thread ORDER BY mid DESC LIMIT 40").fetchall()
+                        f"FROM messages WHERE thread IN (SELECT thread FROM messages WHERE {cond}) GROUP BY thread ORDER BY mid DESC LIMIT 40", args).fetchall()
         rows = ""
         for t in lst:
             dern = c.execute("SELECT created, sender, body FROM messages WHERE thread=? ORDER BY id DESC LIMIT 1", (t["thread"],)).fetchone()
             apercu = dern["body"][:80] + ("…" if len(dern["body"]) > 80 else "")
             bloque = " <span class='etiq critique'>bloqué</span>" if t["n"] >= MAX_PER_THREAD else ""
-            rows += (f"<tr><td><a href='{e(url_with(q, fil=t['thread']))}'>{e(t['thread'])}</a></td><td>{e(_sens(t['paires']))}</td>"
-                     f"<td>{t['n']}/{MAX_PER_THREAD}{bloque}</td><td><small>{e(dern['created'])} · {e(dern['sender'])}</small><br>{e(apercu)}</td></tr>")
+            sel = q.get("fil") == t["thread"]
+            rows += (f"<tr class='{'sel' if sel else ''}'><td><a href='{e(url_with(q, fil=t['thread']))}'{' aria-current=true' if sel else ''}>{e(t['thread'])}</a></td>"
+                     f"<td>{e(_sens(t['paires']))}</td><td>{t['n']}/{MAX_PER_THREAD}{bloque}</td>"
+                     f"<td><small>{e(dern['created'])} · {e(dern['sender'])}</small><br>{e(apercu)}</td></tr>")
     return ("<h3>Fils de discussion (40 plus récents)</h3><div class=table-wrap><table><tr><th>fil<th>sens<th>messages<th>dernier message</tr>"
-            + (rows or "<tr><td colspan=4>aucun fil</td></tr>") + "</table></div>")
+            + (rows or "<tr><td colspan=4>aucun fil pour ce filtre</td></tr>") + "</table></div>")
 
 def fil_detail(q, thread):
     e = html.escape
+    if not thread:
+        return "<h3>Détail du fil</h3><p>Choisis un fil dans la liste pour lire tous ses messages, dans l'ordre.</p>"
     with db() as c:
         msgs = c.execute("SELECT * FROM messages WHERE thread=? ORDER BY id", (thread,)).fetchall()
-    retour = f"<p><a href='{e(url_with(q, fil=None))}'>← retour à la liste des fils</a></p>"
+    retour = f"<p><a href='{e(url_with(q, fil=None))}'>← fermer le fil</a></p>"
     if not msgs: return f"<h3>Fil introuvable</h3>{retour}<p>Aucun message dans le fil <b>{e(thread)}</b>.</p>"
     n = len(msgs)
-    etat = f" — <span class='etiq critique'>fil bloqué (anti-boucle)</span>" if n >= MAX_PER_THREAD else ""
+    etat = " — <span class='etiq critique'>fil bloqué (anti-boucle)</span>" if n >= MAX_PER_THREAD else ""
+    lien = e(f"/ui?fil={quote(thread)}")
+    entete = (f"<h3>Fil {e(thread)} : {n}/{MAX_PER_THREAD} messages{etat}</h3>"
+              f"<p><button class='bouton b-bleu' type=button data-copie-lien='{lien}'>Copier le lien du fil</button></p>{retour}")
     items = "".join(
         f"<div class=bloc><small>{e(m['created'])} · {e(m['sender'])} → {e(m['recipient'])} · {e(m['priority'])} · {'Récupérée' if m['delivered'] else 'À récupérer'}</small>"
-        f"<div style='white-space:pre-wrap;margin-top:6px'>{e(m['body'])}</div></div>" for m in msgs)
-    return f"<h3>Fil {e(thread)} : {n}/{MAX_PER_THREAD} messages{etat}</h3>{retour}{items}"
+        f"<div style='white-space:pre-wrap;margin:6px 0'>{e(m['body'])}</div>"
+        f"<button class='bouton b-gris' type=button data-copie-texte='{e(m['body'])}'>Copier le texte</button></div>" for m in msgs)
+    return entete + items
 
 def journal_block(q):
     e = html.escape
@@ -289,7 +331,7 @@ CSS = """
 *{box-sizing:border-box}
 body{font:14px system-ui,sans-serif;margin:0;padding:16px;background:var(--bg);color:var(--fg)}
 a{color:#8ab4ff}
-h2{margin:0 0 4px;font-size:20px} h3{margin:22px 0 8px;font-size:16px}
+h2{margin:0 0 4px;font-size:20px} h3{margin:18px 0 8px;font-size:16px}
 header.top{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);padding-bottom:10px}
 header.top .meta{color:var(--muted);font-size:13px}
 .cards{display:flex;flex-wrap:wrap;gap:12px;margin:14px 0}
@@ -297,26 +339,37 @@ header.top .meta{color:var(--muted);font-size:13px}
 .carte.A{border-color:var(--A)} .carte.B{border-color:var(--B)}
 .badge{display:inline-block;min-width:26px;text-align:center;border-radius:13px;padding:2px 8px;font-weight:700;color:#111}
 .badge.A{background:var(--A)} .badge.B{background:var(--B)}
-.bloc{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;margin:10px 0}
+.bloc{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;margin:10px 0;min-width:0}
 .urgent{border-color:#b62324}
 .etiq{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;background:#444}
 .etiq.critique{background:var(--ko)}
-.bouton{border:0;padding:7px 14px;border-radius:6px;color:#fff;cursor:pointer;font:inherit}
+.bouton{border:0;padding:7px 14px;border-radius:6px;color:#fff;cursor:pointer;font:inherit;margin:2px 0}
 .b-ok{background:var(--ok)} .b-ko{background:var(--ko)} .b-bleu{background:var(--btn)} .b-gris{background:#444}
 button:focus-visible,a:focus-visible,input:focus-visible,textarea:focus-visible,summary:focus-visible{outline:3px solid #ffd54f;outline-offset:2px}
-input.note{width:100%;max-width:340px;padding:6px;background:#0d0d0d;color:var(--fg);border:1px solid #555;border-radius:6px}
+input.note,input.cherche{width:100%;max-width:340px;padding:6px;background:#0d0d0d;color:var(--fg);border:1px solid #555;border-radius:6px}
 .compteur{font-size:12px;color:var(--muted)}
 .banniere{position:sticky;top:0;z-index:5;background:#263238;border:1px solid #4f6d7a;border-radius:8px;padding:8px 12px;margin:8px 0;display:none}
 .banniere.on{display:block}
 .resultat{background:#1e2d1e;border:1px solid var(--ok);border-radius:8px;padding:10px;margin:10px 0}
 .resultat.ko{background:#2d1e1e;border-color:var(--ko)}
+.filtres{margin:6px 0 10px}
+.filtres a.actif{font-weight:700;color:#fff;text-decoration:underline}
 .table-wrap{overflow-x:auto;margin:8px 0 20px}
 table{border-collapse:collapse;width:100%}
 td,th{border-bottom:1px solid #333;padding:4px 8px;text-align:left;vertical-align:top;word-break:break-word}
 th{color:var(--muted);font-weight:600}
+tr.sel td{background:#1d2a3a}
 small,.petit{color:var(--muted)}
 details{margin:6px 0}
-summary{cursor:pointer;font-weight:600}
+summary{cursor:pointer;font-weight:600;padding:4px 0}
+.fils-grille{display:grid;grid-template-columns:1fr;gap:12px;align-items:start}
+.fils-grille>div{min-width:0}
+@media (min-width:1000px){.fils-grille{grid-template-columns:minmax(340px,1fr) minmax(0,2fr)}}
+#ligne-detail>td{padding:8px 0;border-bottom:0}
+.valeur{white-space:pre-wrap;word-break:break-word;max-height:220px;overflow:auto;background:#0d0d0d;border:1px solid #333;border-radius:6px;padding:6px;margin:0;font:13px ui-monospace,monospace}
+.diff-plus{color:#7ee787} .diff-moins{color:#ff9b9b}
+body.compact td,body.compact th{padding:2px 6px}
+body.compact .bloc{padding:6px 8px;margin:6px 0}
 @media (max-width:640px){body{padding:12px 16px}.carte{flex-basis:100%}}
 """
 
@@ -324,28 +377,101 @@ JS = """
 (function(){
   var st = document.getElementById('etat');
   var boutonPause = document.getElementById('bouton-pause');
+  var boutonDensite = document.getElementById('bouton-densite');
   var statut = document.getElementById('statut-maj');
   var heure = document.getElementById('heure-maj');
   var banniere = document.getElementById('banniere');
   var banniereTexte = document.getElementById('banniere-texte');
   var base = st ? {m: +st.dataset.messages, e: +st.dataset.evenements, n: +st.dataset.enattente, d: +st.dataset.derniere} : null;
   var pauseManuelle = false;
+  var prefs = {};
+  try { prefs = JSON.parse(localStorage.getItem('iapartag-prefs') || '{}') || {}; } catch (x) { prefs = {}; }
+  function sauverPrefs() { try { localStorage.setItem('iapartag-prefs', JSON.stringify(prefs)); } catch (x) {} }
   try { pauseManuelle = sessionStorage.getItem('iapartag-pause') === '1'; } catch (x) {}
+
+  // Préférences : densité, sections repliées, dernier filtre de messages (mémorisées par navigateur)
+  function majDensite() {
+    document.body.classList.toggle('compact', prefs.densite === 'compacte');
+    if (boutonDensite) boutonDensite.textContent = prefs.densite === 'compacte' ? 'Densité : compacte' : 'Densité : normale';
+  }
+  if (boutonDensite) boutonDensite.addEventListener('click', function () {
+    prefs.densite = prefs.densite === 'compacte' ? 'normale' : 'compacte'; sauverPrefs(); majDensite();
+  });
+  majDensite();
+  prefs.sections = prefs.sections || {};
+  document.querySelectorAll('details[data-memo]').forEach(function (d) {
+    var id = d.getAttribute('data-memo');
+    if (prefs.sections[id] === 'ferme') d.removeAttribute('open');
+    else if (prefs.sections[id] === 'ouvert') d.setAttribute('open', '');
+    d.addEventListener('toggle', function () { prefs.sections[id] = d.open ? 'ouvert' : 'ferme'; sauverPrefs(); });
+  });
+  document.addEventListener('click', function (ev) {
+    var a = ev.target.closest ? ev.target.closest('a[data-filtre]') : null;
+    if (a) { prefs.filtre = a.getAttribute('data-filtre'); sauverPrefs(); }
+  });
+  try {
+    var dejaApplique = sessionStorage.getItem('iapartag-filtre-applique') === '1';
+    if (!dejaApplique && !/[?&](filtre|sens)=/.test(location.search) && prefs.filtre) {
+      sessionStorage.setItem('iapartag-filtre-applique', '1');
+      location.replace('/ui?' + prefs.filtre);
+    }
+  } catch (x) {}
+
+  // Copie : lien du fil ou texte d'un message, avec retour « Copié »
+  function repli(texte) {
+    var t = document.createElement('textarea');
+    t.value = texte; t.setAttribute('readonly', ''); t.style.position = 'fixed'; t.style.opacity = '0';
+    document.body.appendChild(t); t.select();
+    try { document.execCommand('copy'); } catch (x) {}
+    document.body.removeChild(t);
+  }
+  function copier(texte, b) {
+    var fait = function () {
+      var ancien = b.textContent; b.textContent = 'Copié';
+      setTimeout(function () { b.textContent = ancien; }, 1500);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(texte).then(fait, function () { repli(texte); fait(); });
+    } else { repli(texte); fait(); }
+  }
+  document.addEventListener('click', function (ev) {
+    var b = ev.target.closest ? ev.target.closest('[data-copie-lien],[data-copie-texte]') : null;
+    if (!b) return;
+    var texte = b.hasAttribute('data-copie-lien') ? location.origin + b.getAttribute('data-copie-lien') : b.getAttribute('data-copie-texte');
+    copier(texte, b);
+  });
+
+  // Sur écran étroit, le détail du fil se place sous la ligne sélectionnée ; sinon à droite de la liste
+  function placerDetail() {
+    var d = document.getElementById('fil-detail'), zone = document.getElementById('zone-detail');
+    if (!d || !zone) return;
+    var ligne = document.getElementById('ligne-detail');
+    var sel = document.querySelector('tr.sel');
+    if (window.matchMedia('(max-width: 999px)').matches && sel) {
+      if (!ligne) {
+        ligne = document.createElement('tr'); ligne.id = 'ligne-detail';
+        var td = document.createElement('td'); td.colSpan = 4; ligne.appendChild(td);
+      }
+      sel.parentNode.insertBefore(ligne, sel.nextSibling);
+      ligne.firstChild.appendChild(d);
+    } else {
+      zone.appendChild(d);
+      if (ligne && ligne.parentNode) ligne.parentNode.removeChild(ligne);
+    }
+  }
+  placerDetail();
+  var tRedim = null;
+  window.addEventListener('resize', function () { clearTimeout(tRedim); tRedim = setTimeout(placerDetail, 150); });
+
   function saisie() {
     var el = document.activeElement;
-    if (el && (el.tagName === 'TEXTAREA' || (el.tagName === 'INPUT' && /^(text|search|password)$/.test(el.type)))) return true;
+    if (el && (el.tagName === 'TEXTAREA' || (el.tagName === 'INPUT' && /^(text|search|password|number)$/.test(el.type)))) return true;
     var notes = document.querySelectorAll('input.note');
     for (var i = 0; i < notes.length; i++) if (notes[i].value.trim() !== '') return true;
     return false;
   }
   function majPause() {
-    if (boutonPause) boutonPause.textContent = pauseManuelle ? 'Reprendre' : 'Pause';
-    if (boutonPause) boutonPause.setAttribute('aria-pressed', pauseManuelle ? 'true' : 'false');
-  }
-  function enPause() {
-    if (pauseManuelle) return 'Actualisation en pause (manuelle)';
-    if (saisie()) return 'Actualisation en pause : saisie en cours';
-    return null;
+    if (boutonPause) { boutonPause.textContent = pauseManuelle ? 'Reprendre' : 'Pause'; boutonPause.setAttribute('aria-pressed', pauseManuelle ? 'true' : 'false'); }
   }
   function afficherStatut(texte) { if (statut) statut.textContent = texte; }
   function sauverDefilement() {
@@ -374,8 +500,9 @@ JS = """
     var c = document.getElementById('compteur-' + n.dataset.id);
     n.addEventListener('input', function () { if (c) c.textContent = n.value.length + ' / 300'; });
   });
+
   function tick() {
-    var raison = enPause();
+    var raison = pauseManuelle ? 'Actualisation en pause (manuelle)' : (saisie() ? 'Actualisation en pause : saisie en cours' : null);
     if (raison) return afficherStatut(raison + ' — la saisie est conservée.');
     if (!base) return;
     fetch('/ui/etat?depuis=' + base.m, {cache: 'no-store', credentials: 'same-origin'}).then(function (r) {
@@ -434,8 +561,9 @@ async def ui(req: Request):
     role = human_role(req)
     if not role:
         return Response("Authentification requise", status_code=401, headers={"WWW-Authenticate": 'Basic realm="IA-partag"'})
-    ags, msgs, evs, unread = state(); e = html.escape
+    ags, msgs, _, unread = state(); e = html.escape
     q = dict(req.query_params)
+    msgs = [m for m in msgs if _garde_msg(m, q)]
     with db() as c:
         cmax = c.execute("SELECT COALESCE(MAX(id),0) m FROM messages").fetchone()["m"]
         emax = c.execute("SELECT COALESCE(MAX(id),0) m FROM events").fetchone()["m"]
@@ -443,17 +571,21 @@ async def ui(req: Request):
     rows = "".join(f"<tr><td>{e(m['created'])}</td><td>{e(m['sender'])}→{e(m['recipient'])}</td><td><a href='{e(url_with(q, fil=m['thread']))}'>{e(m['thread'])}</a></td><td>{'Récupérée' if m['delivered'] else 'À récupérer'}</td><td>{e(m['priority'])}</td><td>{e(m['body'][:200])}</td></tr>" for m in msgs)
     entete = (f"<header class=top><div><h2>IA-partag — suivi</h2><span class=meta>Connecté : <b>{e(_libelle_role(role))}</b></span></div>"
               f"<div class=meta>Dernière actualisation : <span id=heure-maj>{now()[11:]}</span> · <span id=statut-maj>Actualisation automatique</span><br>"
-              "<button id=bouton-pause class='bouton b-gris' type=button aria-pressed=false>Pause</button></div></header>"
+              "<button id=bouton-pause class='bouton b-gris' type=button aria-pressed=false>Pause</button> "
+              "<button id=bouton-densite class='bouton b-gris' type=button>Densité : normale</button></div></header>"
               f"<div id=etat data-messages={cmax} data-evenements={emax} data-enattente={ap['n']} data-derniere={ap['m']}></div>"
               "<div id=banniere class=banniere role=status><span id=banniere-texte>Nouveautés disponibles.</span> "
               "<button class='bouton b-bleu' type=button onclick='iapartagRecharger()'>Afficher</button></div>")
     fil = q.get("fil", "")[:100]
-    corps_fils = fil_detail(q, fil) if fil else fils_block(q)
-    appr = approvals_block(role) + memory_block() + ((pairing_block() + invite_block()) if role == "owner" else "")
-    body = (f"{entete}{res_banner(req.query_params)}<div class=cards>{cartes_block(ags, unread)}</div>{appr}"
-            f"<div id=fils>{corps_fils}</div>"
-            f"<h3>Messages (30 derniers)</h3><div class=table-wrap><table><tr><th>date<th>sens<th>fil<th>état<th>prio<th>texte</tr>{rows}</table></div>"
-            f"{journal_block(q)}<small>Affichage : {now()}</small>")
+    appr = approvals_block(role) + ((pairing_block() + invite_block()) if role == "owner" else "")
+    corps_fil = (f"<div class=fils-grille><div id=liste-fils>{fils_block(q)}</div>"
+                 f"<div id=zone-detail><div id=fil-detail>{fil_detail(q, fil)}</div></div></div>")
+    body = (f"{entete}{res_banner(q)}<div class=cards>{cartes_block(ags, unread)}</div>{appr}"
+            f"<h3>Fils et messages</h3>{filtres_bar(q)}{corps_fil}"
+            f"<details open data-memo=messages><summary>Messages (30 derniers)</summary><div class=table-wrap><table><tr><th>date<th>sens<th>fil<th>état<th>prio<th>texte</tr>{rows}</table></div></details>"
+            f"<details open data-memo=memoire><summary>Mémoire partagée (lecture seule)</summary>{memory_block(q)}</details>"
+            f"<details open data-memo=journal><summary>Journal et sauvegardes</summary>{journal_block(q)}</details>"
+            f"<small>Affichage : {now()}</small>")
     return HTMLResponse(_page(body))
 
 def blocked_page(exc):
@@ -617,10 +749,31 @@ async def pair(req: Request):
         event("appairage", f"un PC s'est appairé comme Claude {found['agent']}", c)
     return JSONResponse({"url": f"http://{CFG['host']}:{CFG['port']}", "token": TOKENS[found["agent"]], "agent": found["agent"]})
 
+def _etat_code(r, t):
+    if r is None: return "aucun code généré"
+    if not r["used"] and r["expires"] >= t:
+        return f"actif, créé à {r['created'][11:16]}, expire à {r['expires'][11:16]}"
+    return f"créé à {r['created'][11:16]} : expiré, ou déjà utilisé ou remplacé"
+
 def pairing_block():
-    forms = "".join(f"<form method=post action='/ui/pair-create' style='display:inline-block;margin-right:10px'><input type=hidden name=agent value={a}><input type=hidden name=csrf value={csrf('pair-' + a)}>"
-                    f"<button class='bouton b-bleu'>Générer un code pour le Claude {a}</button></form>" for a in AGENTS)
-    return f"<h3>Appairer un PC (sans clé USB)</h3><p><small>Code à usage unique, valable {PAIR_TTL_MIN} min. À donner au Claude de l'autre PC.</small></p>{forms}"
+    e = html.escape
+    t = now()
+    with db() as c:
+        dern = {a: c.execute("SELECT * FROM pairings WHERE agent=? ORDER BY id DESC LIMIT 1", (a,)).fetchone() for a in AGENTS}
+    lignes, forms = "", ""
+    for a in AGENTS:
+        r = dern[a]
+        actif = bool(r and not r["used"] and r["expires"] >= t)
+        lignes += f"<li>Code pour le Claude {a} : {e(_etat_code(r, t))}</li>"
+        libelle = f"Remplacer le code pour le Claude {a}" if actif else f"Générer un code pour le Claude {a}"
+        confirm = " onsubmit=\"return confirm('Le code actuel ne sera plus valable. Continuer ?')\"" if actif else ""
+        forms += (f"<form method=post action='/ui/pair-create' style='display:inline-block;margin-right:10px'{confirm}>"
+                  f"<input type=hidden name=agent value={a}><input type=hidden name=csrf value={csrf('pair-' + a)}>"
+                  f"<button class='bouton b-bleu'>{libelle}</button></form>")
+    return (f"<h3>Appairer un PC (sans clé USB)</h3>"
+            f"<p><small>Commande réservée au propriétaire. Code à usage unique, valable {PAIR_TTL_MIN} min, à donner au Claude de l'autre PC.<br>"
+            "Effet : le PC qui saisit le code reçoit le jeton du Claude choisi. Le compte de l'humain du PC 2 n'est pas modifié.</small></p>"
+            f"<ul>{lignes}</ul>{forms}")
 
 INVITE_TTL_MIN = 10
 
@@ -633,9 +786,25 @@ def migrate():
             CREATE TABLE IF NOT EXISTS invites(id INTEGER PRIMARY KEY AUTOINCREMENT, code_hash TEXT, created TEXT, expires TEXT, used INTEGER DEFAULT 0);""")
 
 def invite_block():
-    return (f"<h3>Inviter l'humain du PC 2</h3><p><small>Génère un code (valable {INVITE_TTL_MIN} min, usage unique). La personne ouvre http://{CFG['host']}:{CFG['port']}/invite sur son PC et choisit elle-même son mot de passe : tu ne le connaîtras pas.</small></p>"
-            f"<form method=post action='/ui/invite-create'><input type=hidden name=csrf value={csrf('invite')}>"
-            "<button class='bouton' style='background:#8957e5'>Générer un code d'invitation</button></form>")
+    e = html.escape
+    t = now()
+    with db() as c:
+        inv = c.execute("SELECT * FROM invites ORDER BY id DESC LIMIT 1").fetchone()
+        hum = c.execute("SELECT created FROM humans WHERE name='humain-A'").fetchone()
+    actif = bool(inv and not inv["used"] and inv["expires"] >= t)
+    etat = "aucun code généré" if inv is None else _etat_code(inv, t)
+    if hum:
+        effet = f"le compte humain-A existe depuis le {e(hum['created'])} : valider le code <b>remplacera son mot de passe</b>."
+    else:
+        effet = "aucun compte humain-A pour l'instant : valider le code <b>créera le compte humain-A</b>."
+    libelle = "Remplacer le code" if actif else "Générer un code d'invitation"
+    confirm = " onsubmit=\"return confirm('Le code actuel ne sera plus valable. Continuer ?')\"" if actif else ""
+    return (f"<h3>Inviter l'humain du PC 2</h3>"
+            f"<p><small>Commande réservée au propriétaire. Destinataire : humain du PC 2 (identifiant <b>humain-A</b>). "
+            f"Code à usage unique, valable {INVITE_TTL_MIN} min. La personne ouvre http://{e(CFG['host'])}:{CFG['port']}/invite et choisit elle-même son mot de passe.</small></p>"
+            f"<p>Dernier code : {e(etat)}.<br>Effet à la validation : {effet}</p>"
+            f"<form method=post action='/ui/invite-create'{confirm}><input type=hidden name=csrf value={csrf('invite')}>"
+            f"<button class='bouton' style='background:#8957e5'>{libelle}</button></form>")
 
 async def invite_create(req: Request):
     if not is_admin(req): return Response("Réservé au propriétaire", status_code=401)
@@ -737,11 +906,54 @@ async def memory_put(req: Request):
         event("memoire", f"{me} a écrit la clé {key[:60]} (v{nv})", c)
     return JSONResponse({"ok": True, "key": key, "version": nv})
 
-def memory_block():
+def _like(s):
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+def memory_block(q):
     e = html.escape
-    with db() as c: rows = c.execute("SELECT key,version,author,updated,substr(value,1,120) v FROM memory ORDER BY updated DESC LIMIT 20").fetchall()
-    body = "".join(f"<tr><td>{e(r['key'])}</td><td>v{r['version']}</td><td>{e(r['author'])}</td><td>{e(r['updated'])}</td><td>{e(r['v'])}</td></tr>" for r in rows)
-    return "<h3>Mémoire partagée (lecture seule)</h3><div class=table-wrap><table><tr><th>clé<th>version<th>auteur<th>maj<th>début de la valeur</tr>" + (body or "<tr><td colspan=5>vide</td></tr>") + "</table></div>"
+    mem = q.get("mem", "")[:100]
+    cle = q.get("cle", "")[:100]
+    with db() as c:
+        if mem:
+            rows = c.execute("SELECT * FROM memory WHERE key LIKE ? ESCAPE '\\' ORDER BY key", (f"%{_like(mem)}%",)).fetchall()
+        else:
+            rows = c.execute("SELECT * FROM memory ORDER BY key").fetchall()
+        histo = c.execute("SELECT version, author, ts FROM memory_history WHERE key=? ORDER BY version", (cle,)).fetchall() if cle else []
+    body = "".join(
+        f"<tr><td>{e(r['key'])}</td><td>v{r['version']}</td><td>{e(r['author'])}</td><td>{e(r['updated'])}</td>"
+        f"<td><pre class=valeur>{e(r['value'])}</pre></td></tr>" for r in rows)
+    recherche = (f"<form method=get action=/ui><label for=mem>Chercher une clé</label> "
+                 f"<input class=cherche id=mem name=mem value='{e(mem)}' maxlength=100> <button class='bouton b-gris'>Chercher</button>"
+                 + (f" <a href='{e(url_with(q, mem=None))}'>Effacer la recherche</a>" if mem else "") + "</form>")
+    comparaison = (f"<form method=get action=/ui style='margin-top:10px'><label for=cle>Comparer deux versions d'une clé</label> "
+                   f"<input class=cherche id=cle name=cle value='{e(cle)}' maxlength=100 style='max-width:200px'> "
+                   "v <input name=v1 type=number min=1 style='width:70px'> → v <input name=v2 type=number min=1 style='width:70px'> "
+                   "<button class='bouton b-gris'>Comparer</button></form>")
+    res = ""
+    if cle:
+        vers = ", ".join(f"v{h['version']} ({e(h['author'])}, {e(h['ts'])})" for h in histo) or "aucune version historisée"
+        res += f"<p><small>Versions de {e(cle)} : {vers}</small></p>"
+        if q.get("v1") and q.get("v2"):
+            try:
+                v1, v2 = int(q["v1"]), int(q["v2"])
+                with db() as c:
+                    a = c.execute("SELECT value FROM memory_history WHERE key=? AND version=?", (cle, v1)).fetchone()
+                    b = c.execute("SELECT value FROM memory_history WHERE key=? AND version=?", (cle, v2)).fetchone()
+            except ValueError:
+                a = b = None
+            if a and b:
+                lignes = []
+                for l in difflib.unified_diff(a["value"].splitlines(), b["value"].splitlines(), f"v{v1}", f"v{v2}", lineterm=""):
+                    if l.startswith("+++") or l.startswith("---") or l.startswith("@@"): lignes.append(f"<small>{e(l)}</small>")
+                    elif l.startswith("+"): lignes.append(f"<span class=diff-plus>{e(l)}</span>")
+                    elif l.startswith("-"): lignes.append(f"<span class=diff-moins>{e(l)}</span>")
+                    else: lignes.append(e(l))
+                res += "<pre class=valeur>" + ("\n".join(lignes) or "Aucune différence de contenu entre ces deux versions.") + "</pre>"
+            else:
+                res += "<p>Version introuvable pour cette clé.</p>"
+    return ("<h3>Mémoire partagée (lecture seule)</h3>" + recherche +
+            "<div class=table-wrap><table><tr><th>clé<th>version<th>auteur<th>maj<th>valeur complète</tr>"
+            + (body or "<tr><td colspan=5>aucune clé ne correspond</td></tr>") + "</table></div>" + comparaison + res)
 
 def backup_now(tag="auto"):
     BACKUP_DIR.mkdir(exist_ok=True)
