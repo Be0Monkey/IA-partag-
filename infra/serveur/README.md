@@ -17,6 +17,8 @@ Prérequis : Python 3.13 (ou version récente de Python 3), et les paquets `star
 python -m pip install starlette uvicorn
 ```
 
+Aucune autre dépendance : les formulaires de `/ui` (décision, appairage, invitation) sont lus directement par le serveur, sans `python-multipart`. Ne pas installer ce paquet n'est pas une erreur.
+
 Figer les versions dans un `requirements.txt` local après installation (non fourni ici).
 
 ## Disposition des fichiers à l'exécution
@@ -59,9 +61,22 @@ Depuis `infra/` (la racine de données) :
 python serveur/app.py
 ```
 
-Le serveur écoute sur `host:port` (routes `/send`, `/inbox`, `/heartbeat`, `/status`, `/approval`, `/memory`, `/memory/put`, `/pair`, `/invite`, `/backup/latest`, interface `/ui`). Une sauvegarde de la base est faite au démarrage puis toutes les 6 heures.
+Le serveur écoute sur `host:port` (routes `/send`, `/inbox`, `/heartbeat`, `/status`, `/approval`, `/memory`, `/memory/put`, `/pair`, `/invite`, `/backup/latest`, interface `/ui`, et `/ui/etat` pour son actualisation légère). Une sauvegarde de la base est faite au démarrage puis toutes les 6 heures.
 
 Arrêt : interrompre le processus (Ctrl+C), ou arrêter le processus qui écoute sur le port.
+
+## Tests de `/ui`
+
+Les tests tournent sur une copie temporaire (jamais sur la vraie base) et ne demandent aucune dépendance supplémentaire. Depuis `infra/` :
+
+```bash
+python serveur/tests/lot1_check.py serveur/app.py
+python serveur/tests/lot2_check.py serveur/app.py
+python serveur/tests/lot3_check.py serveur/app.py
+python serveur/tests/routes_check.py serveur/app.py sortie.json
+```
+
+`routes_check.py` écrit dans `sortie.json` le code HTTP de chaque route ; le comparer avec la version précédente permet de vérifier que messages, mémoire, validations et appairage répondent comme avant. Le comportement du JavaScript de `/ui` (actualisation, copie, préférences) n'est pas couvert par ces tests : il se vérifie dans le navigateur.
 
 ## Restauration
 
